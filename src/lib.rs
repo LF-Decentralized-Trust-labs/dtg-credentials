@@ -127,7 +127,7 @@ impl DTGCredential {
     /// Sign the credential using W3C Data Integrity Proof with JCS EdDSA 2022
     /// signing_secret: The secret key to use to sign the credential
     /// create_time: Optional creation time for the proof, defaults to now if None
-    pub fn sign(
+    pub async fn sign(
         &mut self,
         signing_secret: &Secret,
         create_time: Option<DateTime<Utc>>,
@@ -137,7 +137,8 @@ impl DTGCredential {
             None,
             signing_secret,
             create_time.map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-        )?;
+        )
+        .await?;
 
         self.credential.proof = Some(proof.clone());
         Ok(proof)
@@ -1050,8 +1051,8 @@ mod tests {
     }
 
     #[cfg(feature = "affinidi-signing")]
-    #[test]
-    fn test_signing() {
+    #[tokio::test]
+    async fn test_signing() {
         use affinidi_secrets_resolver::secrets::Secret;
 
         let secret = Secret::generate_ed25519(None, None);
@@ -1063,7 +1064,7 @@ mod tests {
             None,
         );
 
-        assert!(cred.sign(&secret, Some(Utc::now())).is_ok());
+        assert!(cred.sign(&secret, Some(Utc::now())).await.is_ok());
 
         assert!(
             cred.verify_proof_with_public_key(secret.get_public_bytes())
@@ -1078,8 +1079,8 @@ mod tests {
     }
 
     #[cfg(feature = "affinidi-signing")]
-    #[test]
-    fn test_signing_error() {
+    #[tokio::test]
+    async fn test_signing_error() {
         use affinidi_secrets_resolver::secrets::Secret;
 
         let secret = Secret::generate_x25519(None, None).unwrap();
@@ -1091,7 +1092,7 @@ mod tests {
             None,
         );
 
-        assert!(cred.sign(&secret, Some(Utc::now())).is_err());
+        assert!(cred.sign(&secret, Some(Utc::now())).await.is_err());
     }
 
     #[cfg(feature = "affinidi-signing")]
