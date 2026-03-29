@@ -7,6 +7,8 @@ for more information.
 
 This library supports both W3C VC 1.1 and 2.0 specifications.
 
+See [CHANGELOG.md](CHANGELOG.md) for release history.
+
 ## Credential Type Hierarchy
 
 All credentials inherit from the abstract `DTGCredential`.
@@ -43,7 +45,7 @@ Example:
 let vpc = DTGCredential::new_vpc(issuer, subject, valid_from, valid_to);
 ```
 
-The created `TDGCredential` can be Serialized to JSON using `serde_json` allowing
+The created `DTGCredential` can be serialized to JSON using `serde_json` allowing
 it to be passed into various signing libraries
 
 ## Signing credentials
@@ -54,7 +56,7 @@ credential
 ```Rust
 let mut vpc = DTGCredential::new_vpc(issuer, subject, valid_from, valid_to);
 
-vpc.sign(&signing_key)?;
+vpc.sign(&signing_key).await?;
 ```
 
 ### Verifying credentials
@@ -68,7 +70,7 @@ key, then you can directly verify the credential:
 let signing_key = Secret::generate_ed25519(None, None);
 let mut vpc = DTGCredential::new_vpc(issuer, subject, valid_from, valid_to);
 
-vpc.sign(&signing_key)?;
+vpc.sign(&signing_key).await?;
 
 vpc.verify(&signing_key.get_public_bytes())?;
 ```

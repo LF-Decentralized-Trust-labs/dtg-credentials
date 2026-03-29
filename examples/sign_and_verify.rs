@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     let unsigned_vpc = vpc.clone();
 
     // Sign the VPC Credential using the issuer's Secret
-    let proof = vpc.sign(&issuer_secret, None)?;
+    let proof = vpc.sign(&issuer_secret, None).await?;
     println!("*************************************************************************");
     println!(
         "Signed the VPC:\n\n{}",
