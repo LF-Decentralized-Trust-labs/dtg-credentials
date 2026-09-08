@@ -7,7 +7,150 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+## [0.7.0] - 2026-09-08
+
+Brings the library up to **Working Draft 02** of the DTG Core Credentials
+specification. Both drafts the 0.6.0 release tracked have merged — the VAC as PR #29 and
+the VDC as PR #19 — and the digest encoding changed underneath them. This release is
+breaking on the wire as well as in the API.
+
+### Changed — the digest encoding (breaking, on the wire)
+
+Working Draft 02 replaced the `sha256:<lowercase hex>` digest with a **base58btc
+multibase multihash**, and renamed the property that carries it from `digest` to
+`digestMultibase`. Every cross-credential reference in the specification now uses that one
+encoding: the member-issued VMC's digest of the grant it acknowledges, the VWC's of the
+edge credential it attests, a VAC's `authority.parent`, and a VDC's `delegation.parent`
+and `delegation.accepts`.
+
+- `DTGCredential::digest_multibase` is the conformant digest, and now excludes the
+  top-level `proof` — it previously included it, which is why it was deprecated. It is
+  un-deprecated. `digest_multibase_json` is its wire-form counterpart.
+- `DTGCredential::digest` and `digest_json` are **deprecated**. They still emit the
+  Working Draft 01 form, unchanged, so a caller migrating can recompute an old digest to
+  compare against one they stored.
+- `CredentialSubjectMembership::digest` and `CredentialSubjectWitness::digest` are renamed
+  to `digest_multibase`, serializing as `digestMultibase`. The old property name `digest`
+  is still **accepted when parsing**, so credentials issued against Working Draft 01 still
+  deserialize. Their *values* do not compare — an old digest reaching a new verifier fails
+  with `InvalidDigest` rather than as a silent mismatch, which is the intended outcome.
+- **Digests are compared as decoded bytes, never as strings.** The specification requires
+  it, because one digest has more than one spelling, and a string comparison would report
+  a mismatch where the two credentials agree. `verify_digest`, `acknowledges` and chain
+  verification all decode. `digests_match` and `decode_digest_multibase` are public for
+  callers doing the comparison themselves.
+- A digest naming a hash algorithm this library does not implement is **rejected**
+  (`UnsupportedDigestAlgorithm`) rather than treated as a mismatch. A governing party may
+  require a stronger hash, and a verifier that conflated the two would silently downgrade
+  that choice into a failed comparison.
+
+### Changed — `authority.parent` is a digest, not an `id` (breaking)
+
+An attenuated VAC now names its parent by digest. This is the change with the most
+reasoning behind it in the specification, and it is worth restating: a digest names
+nothing that can be fetched. Verification cannot come to depend on network availability,
+a verifier cannot be induced to make a request against an address of the *holder's*
+choosing, and nobody hosting an identifier learns when a credential is used.
+
+It also binds a link to the exact claims its issuer narrowed from. Re-issuing a parent
+with different claims orphans the VACs attenuated from it — each must be re-derived, which
+for a chain of narrowing authority is the intended behaviour — while re-proofing it with
+identical claims leaves them undisturbed, because the digest excludes `proof`.
+
+- `DTGCredential::attenuate` no longer requires the parent to carry an `id`, and
+  `DTGCredentialError::AttenuationParentHasNoId` is deprecated and never returned. Not
+  needing a top-level identifier merely in order to be referenced is precisely what the
+  change was for.
+- `DTGCredential::attenuate_from_json` is new: attenuate a VAC that **arrived from a
+  counterparty**, digesting the bytes received rather than a re-serialisation of the
+  parse. The same distinction `new_member_vmc` has always drawn.
+- `authority::AuthorityError::Digest` is new, for a digest that cannot be *read*. Distinct
+  from `BrokenLink` on purpose: a malformed chain and a widening one are different
+  findings, and a verifier that reported one as the other would mislead whoever reads the
+  log.
+
+### Added — the VDC, which was previously a type name and nothing else
+
+0.6.0 shipped `new_vdc` as a `DelegationCredential` type string over a bare subject. It
+carried no `delegation` object, formed no edge, and had no chain verification. All of that
+is now implemented.
+
+- `DelegationGrant` and `CredentialSubject::Delegation`: `scope`, `parent`, `maxDepth`,
+  `accepts`.
+- `DTGCredential::new_vdc` now takes the appointment: a non-empty `scope`, a required
+  `valid_until`, and an optional `max_depth`. **Signature change.**
+- `DTGCredential::new_delegate_vdc` — the delegate's **acceptance**, built from the
+  grant's wire form. The acceptance is REQUIRED: a grant alone establishes what the
+  delegator appointed, not what the delegate agreed to, and a delegator cannot produce the
+  countersignature. Same consent rule as a membership edge, for the same reason.
+- `DTGCredential::accepts` — the delegation counterpart of `acknowledges`: checks the
+  digest *and* that the two halves are the right types and name the same parties in
+  mirrored roles.
+- `DTGCredential::redelegate` and `redelegate_from_json`. Re-delegation is **opt-in**,
+  the opposite default from a VAC's attenuation. A delegate speaks in the principal's
+  name, so the principal keeps the register of who may do so; absence of `maxDepth`
+  prohibits it, and setting it above zero is the delegator's only way to authorise one.
+- `delegation::verify_chain` — scope subset, expiry not beyond the parent's, each link
+  issued by its parent's delegate, depth budget narrowing on the way down, and a chain
+  terminating in a root delegation issued by the principal.
+
+  It returns what the chain **appoints** for, and deliberately not whether the act is
+  permitted. A VDC moves the permission question; it does not answer it. Whether the
+  *principal* may perform the act is the caller's check, against whatever the act requires
+  of them — and the reach of a delegated act is the intersection of the two, never the
+  union.
+
+### Changed — `validUntil` is REQUIRED on a VAC and a VDC (breaking)
+
+`new_vac`, `attenuate`, `new_vdc` and the delegation constructors take a
+`DateTime<Utc>` rather than an `Option`, and both chain verifiers reject a link without
+one (`NoExpiry`). For a VAC the reasoning is sharper than for a VDC: nothing about the
+subject's current standing is consulted when one is verified, so authority that does not
+expire is authority nobody can withdraw by waiting.
+
+### Added — `credentialStatus`, and unmodelled members survive a round trip
+
+`DTGCommon::credential_status` is modelled, and `DTGCommon::extra` captures top-level
+members this library does not name at all. Both exist for the same reason: a
+parse-then-re-serialise used to drop them silently, changing a credential's digest.
+
+This narrows, but does not close, the "digest what you received" hazard — a timestamp is
+still normalized on the way out, so `2026-01-06T10:00:00.000+00:00` and the
+`2026-01-06T10:00:00Z` this library re-emits are the same instant and different bytes.
+The wire-form constructors remain the safe habit, and there is a test pinning exactly
+that.
+
+Status is modelled but **not resolved**: no revocation checking is performed anywhere in
+this crate.
+
+### Fixed
+
+- `new_member_vmc` probed `credentialSubject` for `digest` when deciding whether it had
+  been handed a grant or an acknowledgement. After the rename it would have accepted an
+  acknowledgement as a grant, and acknowledging one forms no edge. It now probes both
+  spellings.
+
+### Notes — what is deliberately not implemented
+
+Three changes to the VAC are in flight upstream and are not here. `audience` is kept
+until the last of them lands, rather than removing a shipped field twice.
+
+- Revocation via `credentialStatus`, cascading to everything attenuated below
+  ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)).
+- A `maxAttenuation` ceiling, bounding depth per-ancestor rather than only globally
+  ([PR #40](https://github.com/trustoverip/dtgwg-cred-spec/pull/40)).
+- Key control at invocation, which **removes `audience`** as redundant
+  ([PR #41](https://github.com/trustoverip/dtgwg-cred-spec/pull/41)). Neither chain
+  verifier establishes that the party presenting a chain controls the leaf's subject
+  identifier; a VAC and a VDC are both non-bearer, and that demonstration belongs to the
+  trust task in which they are exercised.
+
+Correlation scope (PR #30) retired the R-DID / M-DID / C-DID / P-DID identifier types in
+favour of a holder-declared `pairwise` | `directed` | `public`. Nothing to implement yet —
+the specification has not named the property that carries the declaration — so this
+release only drops the retired names from the documentation.
+
+### Changed — dependencies
 
 - Dependencies updated to their current releases. Three are semver-major: `sha2` 0.10 → 0.11,
   and — dev-only — `chacha20poly1305` 0.10 → 0.11 and `rand` 0.8 → 0.10. The `sha2` bump is

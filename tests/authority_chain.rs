@@ -28,7 +28,7 @@ fn root_grant() -> DTGCredential {
         ROOM.into(),
         vec!["read".into(), "write".into(), "curate".into()],
         t(0),
-        Some(t(24 * 30)),
+        t(24 * 30),
     )
     .expect("root grant")
     .with_id("urn:uuid:root-0001")
@@ -41,7 +41,7 @@ fn agent_grant(parent: &DTGCredential) -> DTGCredential {
             AGENT.into(),
             vec!["read".into()],
             t(0),
-            Some(t(4)),
+            t(4),
             Some(AGENT.into()),
         )
         .expect("attenuation")
@@ -94,7 +94,7 @@ fn a_self_issued_grant_is_refused_however_well_formed() {
         ROOM.into(),
         vec!["read".into(), "write".into(), "curate".into()],
         t(0),
-        Some(t(24)),
+        t(24),
     )
     .expect("mallory can build one")
     .with_id("urn:uuid:forged");
@@ -114,14 +114,14 @@ fn attenuation_cannot_add_an_action_the_parent_lacks() {
         ROOM.into(),
         vec!["read".into()],
         t(0),
-        Some(t(24)),
+        t(24),
     )
     .unwrap()
     .with_id("urn:uuid:read-only-root");
 
     // Refused at issue time...
     let err = root
-        .attenuate(AGENT.into(), vec!["write".into()], t(0), Some(t(4)), None)
+        .attenuate(AGENT.into(), vec!["write".into()], t(0), t(4), None)
         .unwrap_err();
     assert!(
         format!("{err}").contains("not conferred by the parent"),
@@ -136,13 +136,16 @@ fn attenuation_cannot_add_an_action_the_parent_lacks() {
         ROOM.into(),
         vec!["write".into()],
         t(0),
-        Some(t(4)),
+        t(4),
     )
     .unwrap()
     .with_id("urn:uuid:widened");
+    // The link is intact — `parent` is the root's digest — so the chain resolves and the
+    // widening is what the verifier has to catch. Pointing it somewhere else would fail as
+    // a broken link and prove nothing about narrowing.
     let mut widened = widened;
     if let Some(g) = widened.credential_mut().authority_mut() {
-        g.parent = Some("urn:uuid:read-only-root".into());
+        g.parent = Some(root.digest_multibase().unwrap());
     }
 
     let err = verify_chain(&[widened, root], ROOM, ROOM, "write", AGENT, t(1)).unwrap_err();
@@ -156,13 +159,7 @@ fn attenuation_cannot_add_an_action_the_parent_lacks() {
 fn attenuation_cannot_outlive_its_parent() {
     let root = root_grant();
     let err = root
-        .attenuate(
-            AGENT.into(),
-            vec!["read".into()],
-            t(0),
-            Some(t(24 * 365)),
-            None,
-        )
+        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(24 * 365), None)
         .unwrap_err();
     assert!(format!("{err}").contains("beyond the parent's"), "{err}");
 }
@@ -178,13 +175,15 @@ fn a_link_issued_by_someone_other_than_the_parents_subject_is_refused() {
         ROOM.into(),
         vec!["read".into()],
         t(0),
-        Some(t(4)),
+        t(4),
     )
     .unwrap()
     .with_id("urn:uuid:grafted");
+    // Mallory cites Bob's root correctly: the digest matches, so the chain resolves. What
+    // must stop her is that she is not the party the root was granted to.
     let mut grafted = grafted;
     if let Some(g) = grafted.credential_mut().authority_mut() {
-        g.parent = Some("urn:uuid:root-0001".into());
+        g.parent = Some(root.digest_multibase().unwrap());
     }
 
     let err = verify_chain(&[grafted, root], ROOM, ROOM, "read", MALLORY, t(1)).unwrap_err();
@@ -254,7 +253,7 @@ fn an_empty_chain_confers_nothing() {
 /// Emptiness is never a wildcard — the failure mode this rule exists to prevent.
 #[test]
 fn a_vac_conferring_no_actions_is_refused_at_construction() {
-    let err = DTGCredential::new_vac(ROOM.into(), BOB.into(), ROOM.into(), vec![], t(0), None)
+    let err = DTGCredential::new_vac(ROOM.into(), BOB.into(), ROOM.into(), vec![], t(0), t(1))
         .unwrap_err();
     assert!(format!("{err}").contains("confers nothing"), "{err}");
 }
@@ -279,7 +278,11 @@ fn a_vac_round_trips_through_json_with_its_grant_intact() {
     let json = serde_json::to_string(&agent).unwrap();
     let back: DTGCredential = serde_json::from_str(&json).unwrap();
     let grant = back.credential().authority().unwrap();
-    assert_eq!(grant.parent.as_deref(), Some("urn:uuid:root-0001"));
+    assert_eq!(
+        grant.parent.as_deref(),
+        Some(root.digest_multibase().unwrap().as_str()),
+        "`parent` is the digest of the credential attenuated from, not its id"
+    );
     assert_eq!(grant.audience.as_deref(), Some(AGENT));
     assert_eq!(grant.actions, vec!["read".to_string()]);
 }
@@ -304,5 +307,199 @@ fn an_empty_actions_list_is_refused_on_deserialization() {
     assert!(
         err.to_string().contains("confers nothing"),
         "empty actions must be refused at the deserialization boundary too: {err}"
+    );
+}
+
+// -------------------------------------------------------------------------------------
+// `parent` is a digest (Working Draft 02)
+// -------------------------------------------------------------------------------------
+
+/// A chain link names its parent by digest, not by identifier. A digest names nothing that
+/// can be fetched, so verification never depends on the network and a verifier cannot be
+/// induced to make a request against an address the holder chooses.
+#[test]
+fn a_link_names_its_parent_by_digest() {
+    let root = root_grant();
+    let agent = agent_grant(&root);
+
+    let parent = agent
+        .credential()
+        .authority()
+        .unwrap()
+        .parent
+        .as_deref()
+        .expect("an attenuated VAC carries a parent");
+
+    assert!(parent.starts_with('z'), "multibase base58btc: {parent}");
+    assert!(dtg_credentials::digests_match(parent, &root.digest_multibase().unwrap()).unwrap());
+}
+
+/// A parent no longer needs a top-level `id` to be attenuated — which is precisely why the
+/// specification made `parent` a digest.
+#[test]
+fn a_parent_without_an_id_can_still_be_attenuated() {
+    let root = DTGCredential::new_vac(
+        ROOM.into(),
+        BOB.into(),
+        ROOM.into(),
+        vec!["read".into(), "write".into()],
+        t(0),
+        t(24 * 30),
+    )
+    .unwrap(); // deliberately no `with_id`
+
+    assert!(root.id().is_none());
+
+    let agent = root
+        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(4), None)
+        .expect("attenuation does not need the parent to have an id");
+
+    let v = verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)).expect("verifies");
+    assert_eq!(v.subject, AGENT);
+}
+
+/// The digest binds to the parent's *claims*, so re-issuing a parent with different claims
+/// orphans the credentials attenuated from the old one — they must be re-derived. For a
+/// chain of narrowing authority that is the intended behaviour.
+#[test]
+fn a_reissued_parent_does_not_carry_its_children() {
+    let root = root_grant();
+    let agent = agent_grant(&root);
+
+    // Same id, same parties, narrower actions — a different credential.
+    let reissued = DTGCredential::new_vac(
+        ROOM.into(),
+        BOB.into(),
+        ROOM.into(),
+        vec!["read".into()],
+        t(0),
+        t(24 * 30),
+    )
+    .unwrap()
+    .with_id("urn:uuid:root-0001");
+
+    let err = verify_chain(&[agent, reissued], ROOM, ROOM, "read", AGENT, t(1)).unwrap_err();
+    assert!(
+        matches!(err, AuthorityError::BrokenLink { index: 0, .. }),
+        "got {err:?}"
+    );
+}
+
+/// Re-*proofing* a parent leaves its children undisturbed, because the digest excludes
+/// `proof`. This is the property that lets a chain survive a key rotation.
+#[test]
+fn a_reproofed_parent_keeps_its_children() {
+    let root = root_grant();
+    let agent = agent_grant(&root);
+
+    let mut reproofed = root.clone();
+    reproofed.credential_mut().proof = None;
+
+    assert!(
+        dtg_credentials::digests_match(
+            &root.digest_multibase().unwrap(),
+            &reproofed.digest_multibase().unwrap()
+        )
+        .unwrap(),
+        "the digest covers the claims, not a signature over them"
+    );
+
+    verify_chain(&[agent, reproofed], ROOM, ROOM, "read", AGENT, t(1)).expect("still verifies");
+}
+
+/// A digest that cannot be *read* is not a digest that disagrees. A Working Draft 01
+/// `sha256:<hex>` parent reaching this verifier is reported as malformed, not as a
+/// widening chain.
+#[test]
+fn a_superseded_parent_digest_is_reported_as_malformed() {
+    let root = root_grant();
+    let mut agent = agent_grant(&root);
+    if let Some(g) = agent.credential_mut().authority_mut() {
+        g.parent =
+            Some("sha256:49c9d5135ab4b5659a343bc79d351e37d64f05add58408cae6eef022828495c2".into());
+    }
+
+    let err = verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)).unwrap_err();
+    assert!(
+        matches!(err, AuthorityError::Digest { index: 0, .. }),
+        "got {err:?}"
+    );
+}
+
+/// Attenuating a VAC that arrived from a counterparty must digest the bytes received, not
+/// a re-serialisation of the parse. A normalized timestamp is enough to make the two differ.
+#[test]
+fn attenuating_from_json_digests_the_wire_form() {
+    let root = root_grant();
+    let mut received = serde_json::to_value(root.credential()).unwrap();
+    received["validFrom"] = serde_json::Value::String("2026-01-06T10:00:00.000+00:00".to_string());
+
+    let agent = DTGCredential::attenuate_from_json(
+        &received,
+        AGENT.into(),
+        vec!["read".into()],
+        t(0),
+        t(4),
+        Some(AGENT.into()),
+    )
+    .expect("attenuation");
+
+    assert_eq!(
+        agent.credential().authority().unwrap().parent.as_deref(),
+        Some(
+            dtg_credentials::digest_multibase_json(&received)
+                .unwrap()
+                .as_str()
+        ),
+        "the parent digest must cover the VAC as it arrived"
+    );
+    assert_eq!(agent.issuer(), BOB, "the holder is read off the parent");
+}
+
+/// The wire-form path enforces the same narrowing rules as the in-process one.
+#[test]
+fn attenuating_from_json_still_refuses_to_widen() {
+    let received = serde_json::to_value(root_grant().credential()).unwrap();
+
+    let err = DTGCredential::attenuate_from_json(
+        &received,
+        AGENT.into(),
+        vec!["delete".into()],
+        t(0),
+        t(4),
+        None,
+    )
+    .unwrap_err();
+
+    assert!(
+        format!("{err}").contains("not conferred by the parent"),
+        "{err}"
+    );
+}
+
+/// `validUntil` is REQUIRED on a VAC. Nothing about the subject's current standing is
+/// consulted here, so authority that never expires is authority nobody can withdraw by
+/// waiting — and a verifier that accepted one would be honouring exactly that.
+#[test]
+fn a_vac_without_an_expiry_is_refused() {
+    let json = serde_json::json!({
+        "@context": [
+            "https://www.w3.org/ns/credentials/v2",
+            "https://firstperson.network/credentials/dtg/v1"
+        ],
+        "type": ["VerifiableCredential", "DTGCredential", "AuthorityCredential"],
+        "issuer": ROOM,
+        "validFrom": "2026-01-06T10:00:00Z",
+        "credentialSubject": {
+            "id": BOB,
+            "authority": { "scope": ROOM, "actions": ["read"] }
+        }
+    });
+
+    let vac: DTGCredential = serde_json::from_value(json).expect("parses");
+    let err = verify_chain(&[vac], ROOM, ROOM, "read", BOB, t(1)).unwrap_err();
+    assert!(
+        matches!(err, AuthorityError::NoExpiry { index: 0 }),
+        "got {err:?}"
     );
 }

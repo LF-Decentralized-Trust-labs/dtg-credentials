@@ -16,6 +16,7 @@ use thiserror::Error;
 
 pub mod authority;
 pub mod create;
+pub mod delegation;
 
 /// What W3C VC Format is the credential using?
 #[derive(Clone, Copy, Debug)]
@@ -71,11 +72,42 @@ pub enum DTGCredentialError {
 
     /// [DTGCredential::attenuate] was called on a VAC with no `id`.
     ///
-    /// A derived credential points at its parent by `id`; a parent without one cannot be
-    /// pointed at, so the chain could never be verified. Set one with
-    /// [DTGCredential::with_id] before attenuating.
+    /// No longer produced. Working Draft 02 makes `authority.parent` a **digest** of the
+    /// parent rather than its `id`, precisely so that no credential needs a top-level
+    /// identifier merely in order to be referenced.
+    #[deprecated(
+        since = "0.7.0",
+        note = "Never returned. `authority.parent` is a digest as of Working Draft 02, so a \
+                parent VAC no longer needs an `id` to be attenuated. This variant will be \
+                removed in a future release."
+    )]
     #[error("cannot attenuate a credential with no id — the derived VAC could not name it")]
     AttenuationParentHasNoId,
+
+    /// A digest value was not a well-formed `digestMultibase`.
+    ///
+    /// Either the multibase envelope or the multihash inside it failed to decode. A
+    /// `sha256:<hex>` value produced against Working Draft 01 lands here, which is the
+    /// intended outcome: it is reported rather than silently compared as unequal.
+    #[error("not a well-formed digestMultibase value: {0}")]
+    InvalidDigest(String),
+
+    /// A digest named a hash algorithm this library does not implement.
+    ///
+    /// The specification permits a governing party to require a stronger hash, and carries
+    /// the algorithm in the value itself. A verifier MUST reject an algorithm it does not
+    /// accept rather than treating it as a mismatch — hence a distinct error.
+    #[error("digest uses multihash algorithm 0x{0:x}, which this library does not accept")]
+    UnsupportedDigestAlgorithm(u64),
+
+    /// A DelegationCredential (VDC) was not a well-formed grant or acceptance.
+    #[error("malformed DelegationCredential: {0}")]
+    MalformedDelegation(String),
+
+    /// A delegation acknowledgement was built against something that is not a
+    /// delegation grant.
+    #[error("Not a delegation grant: {0}")]
+    NotADelegationGrant(String),
 
     /// An attenuation attempted to confer more than its parent held.
     #[error("attenuation would widen the parent grant: {0}")]
@@ -174,14 +206,17 @@ impl DTGCredential {
         self.credential.task_context()
     }
 
-    /// This credential's digest, as the `digest` property of a credential that references
-    /// it — a member-issued VMC acknowledging a membership grant, or a VWC attesting an
-    /// edge credential.
+    /// This credential's digest, in the encoding a credential that references it carries —
+    /// a member-issued VMC acknowledging a membership grant, a VWC attesting an edge
+    /// credential, or the `parent` of an attenuated VAC.
     ///
-    /// Per DTG Core Credentials, the digest is the SHA-256 hash of the credential's JSON
-    /// representation **excluding its top-level `proof` member**, canonicalized with the
-    /// JSON Canonicalization Scheme ([JCS, RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785)),
-    /// encoded as `sha256:` followed by the lowercase hexadecimal digest.
+    /// Per DTG Core Credentials [Digest Encoding], that is the SHA-256 hash of the
+    /// credential's JSON representation **excluding its top-level `proof` member**,
+    /// canonicalized with the JSON Canonicalization Scheme
+    /// ([JCS, RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785)), wrapped in a
+    /// `sha2-256` multihash and encoded base58btc with a multibase `z` prefix.
+    ///
+    /// [Digest Encoding]: https://github.com/trustoverip/dtgwg-cred-spec
     ///
     /// # Why `proof` is excluded
     ///
@@ -190,17 +225,32 @@ impl DTGCredential {
     /// re-signed grant carrying identical claims still satisfies an acknowledgement made
     /// against the earlier signature. It also means the digest can be computed before the
     /// referent is signed, and is stable whichever of its proofs a holder happens to have.
-    /// # ⚠️ Only for a credential this library built
     ///
-    /// This digests the *model*, and the model does not carry every member a
-    /// credential may have — `credentialStatus`, for one, which every VMC issued
-    /// against a status list carries and which `DTGCommon` does not model. Digesting a
-    /// credential that was **received** rather than built here therefore hashes a
-    /// document with those members missing, producing a digest the sender will not
-    /// recognise.
+    /// # Prefer the wire form for a credential you received
     ///
-    /// For a credential that arrived from somewhere else, digest the JSON you received
-    /// with [`digest_json`] — never a re-serialisation of a parse of it.
+    /// This digests the model. [`DTGCommon::extra`] carries top-level members this library
+    /// does not model through a round trip, so for most received credentials the two agree
+    /// — but a member *inside* `credentialSubject` that the subject types do not model is
+    /// still not represented. Where you still hold the bytes a counterparty sent, digest
+    /// those with [`digest_multibase_json`].
+    pub fn digest_multibase(&self) -> Result<String, DTGCredentialError> {
+        let unsigned = DTGCommon {
+            proof: None,
+            ..self.credential.clone()
+        };
+        let value = serde_json::to_value(&unsigned)
+            .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
+        digest_multibase_json(&value)
+    }
+
+    /// This credential's digest in the superseded `sha256:<hex>` encoding.
+    #[deprecated(
+        since = "0.7.0",
+        note = "Working Draft 02 replaced the `sha256:<hex>` digest with a base58btc \
+                multibase multihash under the property name `digestMultibase`. Use \
+                DTGCredential::digest_multibase. This method will be removed in a future \
+                release."
+    )]
     pub fn digest(&self) -> Result<String, DTGCredentialError> {
         let unsigned = DTGCommon {
             proof: None,
@@ -208,61 +258,62 @@ impl DTGCredential {
         };
         let value = serde_json::to_value(&unsigned)
             .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
+        #[allow(deprecated)]
         digest_json(&value)
     }
 
     /// The digest this credential carries of the credential it references, if it carries one.
     ///
-    /// `Some` for a member-issued VMC (which MUST carry one) and for a VWC bound to the edge
-    /// credential it attests; `None` for a community-issued VMC, which MUST omit it, and for
-    /// every credential type that has no `digest` property.
+    /// `Some` for a member-issued VMC (which MUST carry one), for a VWC bound to the edge
+    /// credential it attests, for an attenuated VAC (`authority.parent`), and for a
+    /// derived or accepting VDC (`delegation.parent` / `delegation.accepts`). `None` for a
+    /// community-issued VMC, which MUST omit it, and for a credential that references
+    /// nothing.
     pub fn subject_digest(&self) -> Option<&str> {
         match &self.credential.credential_subject {
-            CredentialSubject::Membership(subject) => subject.digest.as_deref(),
-            CredentialSubject::Witness(subject) => subject.digest.as_deref(),
+            CredentialSubject::Membership(subject) => subject.digest_multibase.as_deref(),
+            CredentialSubject::Witness(subject) => subject.digest_multibase.as_deref(),
+            CredentialSubject::Authority(subject) => subject.authority.parent.as_deref(),
+            CredentialSubject::Delegation(subject) => subject
+                .delegation
+                .accepts
+                .as_deref()
+                .or(subject.delegation.parent.as_deref()),
             _ => None,
         }
     }
 
-    /// Computes the digest of this credential in the multibase multihash encoding.
-    ///
-    /// The underlying hash differs from [DTGCredential::digest] in two ways: it is encoded as
-    /// a base58btc multibase multihash rather than `sha256:<hex>`, and it covers the
-    /// credential *including* its `proof`.
-    #[deprecated(
-        since = "0.4.0",
-        note = "This encoding is not what DTG Core Credentials specifies, so digests \
-                produced by it do not interoperate. Use DTGCredential::digest, which \
-                returns the conformant `sha256:<lowercase hex>` over the proofless JCS \
-                canonical form. This method will be removed in a future release."
-    )]
-    pub fn digest_multibase(&self) -> Result<String, DTGCredentialError> {
-        let canonical = serde_json_canonicalizer::to_vec(&self.credential)
-            .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
-
-        // multihash prefix: 0x12 = sha2-256, 0x20 = 32 byte digest length
-        let mut multihash = Vec::with_capacity(34);
-        multihash.extend_from_slice(&[0x12, 0x20]);
-        multihash.extend_from_slice(&Sha256::digest(&canonical));
-
-        Ok(multibase::encode(Base::Base58Btc, &multihash))
-    }
-
-    /// Checks that this credential's `digest` matches the credential it claims to reference.
+    /// Checks that the digest this credential carries matches the credential it claims to
+    /// reference.
     ///
     /// Answers one question only — whether the hashes agree. It does not check that the two
     /// credentials are of the types the reference requires, nor that their issuers and
     /// subjects line up. For a membership acknowledgement, [DTGCredential::acknowledges]
     /// checks all of that together and is what a verifier completing an edge should call.
     ///
+    /// # Compares bytes, not strings
+    ///
+    /// The specification requires a verifier to decode the multibase envelope and the
+    /// multihash inside it, and to compare the algorithm identifier and the raw digest —
+    /// never the encoded strings. Two equal digests can be written differently, and a
+    /// string comparison would report a mismatch where the credentials agree.
+    ///
     /// Returns `Ok(false)` if the digests do not match, or if this credential carries no
-    /// `digest`, in which case there is nothing to rely on.
+    /// digest, in which case there is nothing to rely on.
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::InvalidDigest] if the carried value is not a well-formed
+    /// `digestMultibase` — a Working Draft 01 `sha256:<hex>` value among them — and
+    /// [DTGCredentialError::UnsupportedDigestAlgorithm] if it names a hash this library
+    /// does not implement. Both are reported rather than folded into `Ok(false)`: a digest
+    /// that cannot be read is not a digest that disagrees.
     pub fn verify_digest(&self, referenced: &DTGCredential) -> Result<bool, DTGCredentialError> {
-        let Some(digest) = self.subject_digest() else {
+        let Some(carried) = self.subject_digest() else {
             return Ok(false);
         };
 
-        Ok(digest == referenced.digest()?)
+        digests_match(carried, &referenced.digest_multibase()?)
     }
 
     /// Does this member-issued VMC acknowledge `grant`, completing that membership edge?
@@ -306,6 +357,57 @@ impl DTGCredential {
         }
 
         self.verify_digest(grant)
+    }
+
+    /// Does this delegate-issued VDC accept `grant`, completing that delegation edge?
+    ///
+    /// A delegation edge is complete only when both VDCs exist and are valid: the
+    /// delegator's grant, and the delegate's acceptance of it. This checks everything that
+    /// binds the two together:
+    ///
+    /// 1. `grant` is a `DelegationCredential` carrying `scope` and no `accepts` — a grant
+    /// 2. `self` is a `DelegationCredential` carrying `accepts` — an acceptance
+    /// 3. the two name the same pair of parties in mirrored roles: this credential's issuer
+    ///    is the grant's subject, and its subject is the grant's issuer
+    /// 4. the `accepts` digest matches the grant
+    ///
+    /// Returns `Ok(false)` where any of those does not hold, rather than distinguishing
+    /// them: a caller deciding whether an edge is complete has one decision to make, and
+    /// every failing case answers it the same way.
+    ///
+    /// # What this does not check
+    ///
+    /// Neither credential's proof, neither validity window, and neither's revocation
+    /// status. Nor does it establish that the *delegator* may perform the act in question
+    /// — that is a separate question, asked of the delegator at the time of the act, which
+    /// a VDC moves but never answers. This covers the binding.
+    pub fn accepts(&self, grant: &DTGCredential) -> Result<bool, DTGCredentialError> {
+        if !matches!(self.type_, DTGCredentialType::Delegation)
+            || !matches!(grant.type_, DTGCredentialType::Delegation)
+        {
+            return Ok(false);
+        }
+
+        let (Some(acceptance), Some(appointment)) =
+            (self.credential.delegation(), grant.credential.delegation())
+        else {
+            return Ok(false);
+        };
+
+        // The grant is the half carrying `scope` and no `accepts`; accepting an acceptance
+        // is not an edge.
+        if appointment.accepts.is_some() || appointment.scope.is_none() {
+            return Ok(false);
+        }
+        let Some(carried) = &acceptance.accepts else {
+            return Ok(false);
+        };
+
+        if self.issuer() != grant.subject() || self.subject() != grant.issuer() {
+            return Ok(false);
+        }
+
+        digests_match(carried, &grant.digest_multibase()?)
     }
 
     /// Returns the proof value if signed else None
@@ -380,30 +482,14 @@ impl DTGCredential {
     }
 }
 
-/// The digest a DTG credential carries of another credential, computed over a
-/// credential in its **wire form**.
+/// The `sha2-256` multihash code, per the [multicodec] table.
 ///
-/// SHA-256 over the RFC 8785 (JCS) canonicalization of `doc` with its top-level `proof`
-/// member removed, encoded as `sha256:` followed by the lowercase hexadecimal digest.
-/// This is what a member-issued VMC carries of the grant it acknowledges, and what a VWC
-/// carries of the edge credential it attests.
-///
-/// # Digest what you received, not what you parsed
-///
-/// Take the document as it arrived. A credential may carry members this library does not
-/// model — `credentialStatus` is the common one — and a parse-then-re-serialise round
-/// trip drops them silently, so the digest would not match the one its issuer computed.
-/// [`DTGCredential::digest`] is safe only for a credential built in-process; anything
-/// received goes through this.
-///
-/// # Why `proof` is excluded
-///
-/// The digest binds to what the credential says, not to a signature over it, so a
-/// reference survives its referent being re-signed. A re-issued credential carries
-/// different claims and therefore a different digest, which is what makes renewal force
-/// re-acknowledgement.
-pub fn digest_json(doc: &Value) -> Result<String, DTGCredentialError> {
-    let proofless = match doc {
+/// [multicodec]: https://www.w3.org/TR/cid-1.0/#multihash
+const MULTIHASH_SHA2_256: u64 = 0x12;
+
+/// Strips a credential's top-level `proof` member, if it has one.
+fn proofless(doc: &Value) -> Value {
+    match doc {
         Value::Object(members) => {
             let mut members = members.clone();
             members.remove("proof");
@@ -412,9 +498,117 @@ pub fn digest_json(doc: &Value) -> Result<String, DTGCredentialError> {
         // Not an object: canonicalize as-is. A shape check belongs to the caller, which
         // has a better error to give than this would.
         other => other.clone(),
-    };
+    }
+}
 
-    let canonical = serde_json_canonicalizer::to_vec(&proofless)
+/// The digest a DTG credential carries of another credential, computed over that
+/// credential in its **wire form**.
+///
+/// This is the encoding DTG Core Credentials calls `digestMultibase`, and every
+/// cross-credential reference in the specification uses it: the member-issued VMC's
+/// `digestMultibase` of the grant it acknowledges, the VWC's of the edge credential it
+/// attests, an attenuated VAC's `authority.parent`, and a VDC's `delegation.parent` and
+/// `delegation.accepts`.
+///
+/// Four steps, per [CID v1.0](https://www.w3.org/TR/cid-1.0/):
+///
+/// 1. canonicalize `doc` with its top-level `proof` member removed, using JCS (RFC 8785);
+/// 2. SHA-256 the resulting UTF-8 bytes;
+/// 3. prefix the `sha2-256` multihash header (`0x12`) and the length (`0x20`);
+/// 4. encode base58btc with the multibase `z` prefix.
+///
+/// # Digest what you received, not what you parsed
+///
+/// Take the document as it arrived. [`DTGCommon::extra`] preserves unmodelled *top-level*
+/// members through a round trip, but the subject types do not model every member a
+/// `credentialSubject` may carry, so a parse-then-re-serialise of an unusual credential
+/// can still differ from the bytes its issuer hashed. Where you hold those bytes, hash
+/// them.
+///
+/// # Why `proof` is excluded
+///
+/// The digest binds to what the credential says, not to a signature over it, so a
+/// reference survives its referent being re-signed. A re-issued credential carries
+/// different claims and therefore a different digest, which is what makes renewal force
+/// re-acknowledgement.
+pub fn digest_multibase_json(doc: &Value) -> Result<String, DTGCredentialError> {
+    let canonical = serde_json_canonicalizer::to_vec(&proofless(doc))
+        .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
+
+    let digest = Sha256::digest(&canonical);
+
+    // multihash prefix: 0x12 = sha2-256, 0x20 = 32 byte digest length. Both are varints,
+    // and both are single-byte at these values.
+    let mut multihash = Vec::with_capacity(2 + digest.len());
+    multihash.push(MULTIHASH_SHA2_256 as u8);
+    multihash.push(digest.len() as u8);
+    multihash.extend_from_slice(&digest);
+
+    Ok(multibase::encode(Base::Base58Btc, &multihash))
+}
+
+/// Decodes a `digestMultibase` value into the algorithm it names and the raw digest bytes.
+///
+/// The specification requires verifiers to compare digests this way rather than as
+/// strings, so that two encodings of the same digest are recognised as equal and an
+/// algorithm the verifier does not accept is *rejected* rather than reported as a
+/// mismatch.
+///
+/// # Errors
+///
+/// [DTGCredentialError::InvalidDigest] if the multibase or multihash envelope is
+/// malformed, or if the declared length does not match the bytes present.
+/// [DTGCredentialError::UnsupportedDigestAlgorithm] if the multihash names anything other
+/// than `sha2-256`.
+pub fn decode_digest_multibase(digest: &str) -> Result<(u64, Vec<u8>), DTGCredentialError> {
+    let (_, bytes) = multibase::decode(digest)
+        .map_err(|e| DTGCredentialError::InvalidDigest(format!("multibase: {e}")))?;
+
+    // Both the code and the length are varints. Every algorithm this library accepts has a
+    // single-byte code and a single-byte length, so a two-byte header is all that is read;
+    // a continuation bit in either is an algorithm we would reject anyway.
+    let (&code, rest) = bytes
+        .split_first()
+        .ok_or_else(|| DTGCredentialError::InvalidDigest("empty multihash".into()))?;
+    if code & 0x80 != 0 {
+        return Err(DTGCredentialError::InvalidDigest(
+            "multi-byte multihash code, which names no algorithm this library accepts".into(),
+        ));
+    }
+    let (&length, raw) = rest
+        .split_first()
+        .ok_or_else(|| DTGCredentialError::InvalidDigest("multihash has no length".into()))?;
+
+    if code as u64 != MULTIHASH_SHA2_256 {
+        return Err(DTGCredentialError::UnsupportedDigestAlgorithm(code as u64));
+    }
+    if length as usize != raw.len() {
+        return Err(DTGCredentialError::InvalidDigest(format!(
+            "multihash declares {length} bytes but carries {}",
+            raw.len()
+        )));
+    }
+
+    Ok((code as u64, raw.to_vec()))
+}
+
+/// Do two `digestMultibase` values refer to the same credential?
+///
+/// Decodes both and compares the algorithm and the raw digest bytes, as
+/// [`decode_digest_multibase`] describes. Never compares the encoded strings.
+pub fn digests_match(left: &str, right: &str) -> Result<bool, DTGCredentialError> {
+    Ok(decode_digest_multibase(left)? == decode_digest_multibase(right)?)
+}
+
+/// A credential's digest in the superseded `sha256:<hex>` encoding.
+#[deprecated(
+    since = "0.7.0",
+    note = "Working Draft 02 replaced the `sha256:<hex>` digest with a base58btc multibase \
+            multihash under the property name `digestMultibase`. Use \
+            digest_multibase_json. This function will be removed in a future release."
+)]
+pub fn digest_json(doc: &Value) -> Result<String, DTGCredentialError> {
+    let canonical = serde_json_canonicalizer::to_vec(&proofless(doc))
         .map_err(|e| DTGCredentialError::Canonicalization(e.to_string()))?;
 
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -441,15 +635,17 @@ pub enum DTGCredentialType {
     /// Verifiable Authority Credential (VAC) — confers authority on a party to perform
     /// specified actions within a named scope governed by the issuer.
     ///
-    /// Tracks a draft: `trustoverip/dtgwg-cred-spec` PR #29. The shape may move before the
-    /// specification is approved.
+    /// Merged into DTG Core Credentials at Working Draft 02
+    /// (`trustoverip/dtgwg-cred-spec` PR #29). Three further changes to the VAC are in
+    /// flight and not implemented here — revocation (PR #39), a `maxAttenuation` ceiling
+    /// (PR #40), and key-control at invocation, which removes `audience` (PR #41).
     Authority,
 
     /// Verifiable Delegation Credential (VDC) — establishes that one entity may act in
     /// another's name.
     ///
-    /// Tracks a draft: `trustoverip/dtgwg-cred-spec` PR #19. The shape may move before the
-    /// specification is approved.
+    /// Merged into DTG Core Credentials at Working Draft 02
+    /// (`trustoverip/dtgwg-cred-spec` PR #19).
     Delegation,
 
     /// R-Card is no longer a DTG credential type.
@@ -585,9 +781,46 @@ pub struct DTGCommon {
     /// The assertion between the entities involved
     pub credential_subject: CredentialSubject,
 
+    /// A W3C VC status mechanism through which a verifier determines whether this
+    /// credential has been revoked.
+    ///
+    /// Held as an opaque [`Value`]: the mechanism is chosen by the governing VTC or VTN,
+    /// and this library neither selects one nor resolves it. `BitstringStatusListEntry` is
+    /// the common choice.
+    ///
+    /// CONDITIONAL on a VDC — REQUIRED where the appointment outlives the freshness window
+    /// the governing party defines for delegations, and permitted to be absent otherwise,
+    /// with short validity and re-issuance preferred wherever the delegator is reachable.
+    /// A status check is a live lookup that reveals the verification event to whoever
+    /// hosts the status list.
+    ///
+    /// # Modelled so that digests survive a round trip
+    ///
+    /// Every VMC issued against a status list carries this, and before it was modelled a
+    /// parse-then-re-serialise dropped it silently — producing a digest its issuer would
+    /// not recognise. See [`DTGCommon::extra`], which closes the same gap for members this
+    /// library does not name at all.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub credential_status: Option<Value>,
+
     /// Cryptographic proof of credential authenticity
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub proof: Option<DataIntegrityProof>,
+
+    /// Top-level members this library does not model, preserved verbatim.
+    ///
+    /// A DTG credential may legitimately carry properties beyond the ones named here —
+    /// `credentialSchema`, `termsOfUse`, `evidence`, an extension a governing party
+    /// defines. Without somewhere to keep them, a parse-then-re-serialise round trip drops
+    /// them, and the digest computed over the result matches nothing the issuer signed.
+    ///
+    /// Capturing them makes [DTGCredential::digest_multibase] agree with
+    /// [`digest_multibase_json`] over the wire form for any credential whose extra members
+    /// are top-level. It is not a complete answer — the `credentialSubject` types still
+    /// reject members they do not model — so where you hold the bytes a counterparty sent,
+    /// hashing those remains the safe habit.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl DTGCommon {
@@ -617,6 +850,7 @@ impl DTGCommon {
             CredentialSubject::Witness(subject) => &subject.id,
             CredentialSubject::Membership(subject) => &subject.id,
             CredentialSubject::Authority(subject) => &subject.id,
+            CredentialSubject::Delegation(subject) => &subject.id,
             CredentialSubject::RCard(subject) => &subject.id,
         }
     }
@@ -641,6 +875,30 @@ impl DTGCommon {
     pub fn authority_mut(&mut self) -> Option<&mut AuthorityGrant> {
         match &mut self.credential_subject {
             CredentialSubject::Authority(subject) => Some(&mut subject.authority),
+            _ => None,
+        }
+    }
+
+    /// The `delegation` object, when this credential is a VDC.
+    ///
+    /// `None` for every other credential type, for the same reason [DTGCommon::authority]
+    /// is fallible: a caller handed a credential of unknown type can ask without first
+    /// matching on `type_`.
+    pub fn delegation(&self) -> Option<&DelegationGrant> {
+        match &self.credential_subject {
+            CredentialSubject::Delegation(subject) => Some(&subject.delegation),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the `delegation` object, when this credential is a VDC.
+    ///
+    /// Present for the same reason as [DTGCommon::authority_mut]: a verifier must be
+    /// testable against chains this library's own constructors would refuse to build,
+    /// since nothing stops another implementation emitting such JSON.
+    pub fn delegation_mut(&mut self) -> Option<&mut DelegationGrant> {
+        match &mut self.credential_subject {
+            CredentialSubject::Delegation(subject) => Some(&mut subject.delegation),
             _ => None,
         }
     }
@@ -681,7 +939,9 @@ impl Default for DTGCommon {
             credential_subject: CredentialSubject::Basic(CredentialSubjectBasic {
                 id: String::new(),
             }),
+            credential_status: None,
             proof: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -706,7 +966,7 @@ impl TryFrom<DTGCommon> for DTGCredential {
                     // `{ id }` — the community-issued grant, which MUST omit `digest`.
                     CredentialSubject::Basic(subject) => CredentialSubjectMembership {
                         id: subject.id.clone(),
-                        digest: None,
+                        digest_multibase: None,
                     },
 
                     // `{ id, digest }` — the member-issued acknowledgement. Shape-identical
@@ -717,7 +977,7 @@ impl TryFrom<DTGCommon> for DTGCredential {
                     CredentialSubject::Witness(subject) if subject.witness_context.is_none() => {
                         CredentialSubjectMembership {
                             id: subject.id.clone(),
-                            digest: subject.digest.clone(),
+                            digest_multibase: subject.digest_multibase.clone(),
                         }
                     }
 
@@ -782,7 +1042,7 @@ impl TryFrom<DTGCommon> for DTGCredential {
                                 credential_subject: CredentialSubject::Witness(
                                     CredentialSubjectWitness {
                                         id: subject.id.clone(),
-                                        digest: None,
+                                        digest_multibase: None,
                                         witness_context: None,
                                     },
                                 ),
@@ -815,11 +1075,63 @@ impl TryFrom<DTGCommon> for DTGCredential {
                     _ => Err(DTGCredentialError::UnknownCredential),
                 }
             }
-            DTGCredentialType::Delegation => Ok(DTGCredential {
-                type_: DTGCredentialType::Delegation,
-                version: value.context.as_slice().try_into()?,
-                credential: value,
-            }),
+            DTGCredentialType::Delegation => {
+                // A VDC's subject must carry the appointment. `Basic` — a bare `{ id }` —
+                // is where a caller lands when `delegation` is missing entirely, and a
+                // credential that appoints nobody to nothing is malformed rather than
+                // merely empty.
+                match &value.credential_subject {
+                    CredentialSubject::Delegation(subject) => {
+                        let d = &subject.delegation;
+
+                        // The two halves are distinguished by `accepts`, and each half has
+                        // exactly one shape. Refusing the mixtures here means a caller
+                        // cannot construct one by deserialization either.
+                        match (&d.accepts, &d.scope) {
+                            (Some(_), Some(_)) => {
+                                return Err(DTGCredentialError::MalformedDelegation(
+                                    "carries both `accepts` and `scope`: an acceptance \
+                                     consents to the scope of the grant it names rather \
+                                     than restating it"
+                                        .into(),
+                                ));
+                            }
+                            (Some(_), None) => {
+                                if d.parent.is_some() || d.max_depth.is_some() {
+                                    return Err(DTGCredentialError::MalformedDelegation(
+                                        "an acceptance carries `accepts` and nothing else".into(),
+                                    ));
+                                }
+                            }
+                            (None, Some(scope)) => {
+                                if scope.is_empty() {
+                                    return Err(DTGCredentialError::MalformedDelegation(
+                                        "a grant's `scope` MUST contain at least one \
+                                         entry — emptying it is not how an unbounded \
+                                         appointment is expressed, because there is no \
+                                         way to express one"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                            (None, None) => {
+                                return Err(DTGCredentialError::MalformedDelegation(
+                                    "carries neither `scope` nor `accepts`, so it is \
+                                     neither a grant nor an acceptance"
+                                        .into(),
+                                ));
+                            }
+                        }
+
+                        Ok(DTGCredential {
+                            type_: DTGCredentialType::Delegation,
+                            version: value.context.as_slice().try_into()?,
+                            credential: value,
+                        })
+                    }
+                    _ => Err(DTGCredentialError::UnknownCredential),
+                }
+            }
             DTGCredentialType::RCard => match &value.credential_subject {
                 CredentialSubject::RCard { .. } => Ok(DTGCredential {
                     type_: DTGCredentialType::RCard,
@@ -897,6 +1209,12 @@ pub enum CredentialSubject {
     /// landing here.
     Authority(CredentialSubjectAuthority),
 
+    /// Verifiable Delegation Credential subject.
+    ///
+    /// Unambiguous for the same reason as [CredentialSubject::Authority]: `delegation` is
+    /// carried by no other DTG subject.
+    Delegation(CredentialSubjectDelegation),
+
     /// Membership Credential subject, carrying the OPTIONAL `digest` that a member-issued
     /// VMC MUST set.
     ///
@@ -929,8 +1247,8 @@ pub struct CredentialSubjectBasic {
 /// # Attenuation
 ///
 /// A holder may derive a narrower VAC from one they hold without involving the issuer. An
-/// attenuated VAC sets [AuthorityGrant::parent] to the `id` of the credential it derives
-/// from, and MUST NOT widen `actions`, `scope`, or the validity window. Verification walks
+/// attenuated VAC sets [AuthorityGrant::parent] to the **digest** of the credential it
+/// derives from, and MUST NOT widen `actions`, `scope`, or the validity window. Verification walks
 /// the chain to a VAC issued by the party governing the scope — see
 /// [crate::authority::verify_chain], which is where the security of this credential
 /// actually lives. Issuing one is a struct and a signature; refusing a widening link is the
@@ -952,10 +1270,22 @@ pub struct AuthorityGrant {
     /// `write` unless both are listed.
     pub actions: Vec<String>,
 
-    /// The `id` of the VAC this one was attenuated from.
+    /// The **digest** of the VAC this one was attenuated from, as
+    /// [DTGCredential::digest_multibase] computes it.
     ///
     /// Absent means this VAC was issued directly by the party governing the scope, and is
     /// therefore a chain root.
+    ///
+    /// # A digest, not an identifier
+    ///
+    /// Working Draft 02 made this deliberate rather than incidental. A digest names
+    /// nothing that can be fetched, so verification cannot come to depend on network
+    /// availability, a verifier cannot be induced to make a request against an address of
+    /// the holder's choosing, and nobody hosting an identifier learns when a credential is
+    /// used. It also binds an attenuated VAC to the exact claims its issuer narrowed from:
+    /// re-issuing a parent with different claims does not re-parent the children of the
+    /// old one, while re-proofing it with identical claims leaves them undisturbed,
+    /// because the digest excludes `proof`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
 
@@ -963,8 +1293,82 @@ pub struct AuthorityGrant {
     ///
     /// Absent means any holder may present it. Setting it is what makes a leaked agent
     /// credential useless to anyone but that agent.
+    ///
+    /// # Slated for removal upstream
+    ///
+    /// `trustoverip/dtgwg-cred-spec` PR #41 removes this property, having made it
+    /// redundant: a VAC is not a bearer credential, and requiring the leaf's subject to
+    /// demonstrate key control at invocation already establishes that the presenter is the
+    /// subject. It is kept here until that lands, because removing a shipped field twice
+    /// is worse than removing it once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
+}
+
+/// The `delegation` object a [CredentialSubject::Delegation] carries.
+///
+/// A VDC is one of a **pair**. The delegator issues a *grant* — carrying `scope`, and
+/// optionally `parent` and `maxDepth` — and the delegate answers with an *acceptance*
+/// carrying `accepts` and nothing else. The two together form a complete DTG edge, and a
+/// verifier MUST have both: a grant alone establishes what the delegator appointed, not
+/// what the delegate agreed to.
+///
+/// # A VDC is not authority
+///
+/// It never supplies permission the delegator did not itself hold. A verifier presented
+/// with one substitutes the delegator for the delegate and then asks the permission
+/// question it would have asked of the delegator directly — live, at the time of the act.
+/// The reach of a delegated act is the *intersection* of what the delegator may do and
+/// what the chain appoints the delegate for. See [AuthorityGrant] for the credential that
+/// answers the permission question.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DelegationGrant {
+    /// The acts the delegate may perform in the delegator's name.
+    ///
+    /// REQUIRED on a grant and MUST contain at least one entry — a VDC MUST NOT express an
+    /// unbounded appointment by omitting or emptying it. MUST be omitted on an acceptance,
+    /// which consents to the scope of the grant it names rather than restating it.
+    ///
+    /// Entries are opaque strings compared for exact equality. The specification defines no
+    /// wildcard, prefix or hierarchical semantics, so the subset test on a chain is set
+    /// inclusion over exact matches; a governing vocabulary that wants structure must put
+    /// it in the terms themselves.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scope: Option<Vec<String>>,
+
+    /// The digest of the VDC this delegation was derived from, when the delegator is
+    /// itself acting under a delegation. A VDC with no `parent` is a **root delegation**.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent: Option<String>,
+
+    /// The number of further re-delegations permitted below this one.
+    ///
+    /// `0` prohibits re-delegation, and so does **absence** — the default is a single hop.
+    /// Setting it above `0` is the delegator's explicit authorisation to re-delegate;
+    /// there is no other. Note that this is the opposite default from a VAC, where
+    /// attenuation is permitted unless forbidden: a delegate speaks in the principal's
+    /// name, so the principal keeps the register of who may do so.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_depth: Option<u32>,
+
+    /// The digest of the grant being accepted.
+    ///
+    /// REQUIRED on an acceptance and MUST be omitted on a grant. Its presence is what
+    /// distinguishes the two halves of a delegation edge.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub accepts: Option<String>,
+}
+
+/// Delegation Credential subject
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialSubjectDelegation {
+    /// DID of the delegate on a grant; DID of the delegator on an acceptance.
+    pub id: String,
+
+    /// The appointment itself.
+    pub delegation: DelegationGrant,
 }
 
 /// Verifiable Authority Credential (VAC) subject.
@@ -983,21 +1387,31 @@ pub struct CredentialSubjectAuthority {
 /// The two directions of a membership edge share this shape and are told apart by
 /// `digest`: a community-issued VMC (the membership grant) MUST omit it, and a
 /// member-issued VMC (the membership acknowledgement) MUST carry it. Where both endpoints
-/// are C-DIDs, as in VTN membership, `digest` is the only discriminator — the issuer and
-/// subject rules cannot separate the directions.
+/// are community identifiers, as in VTN membership, `digestMultibase` is the only
+/// discriminator — the issuer and subject rules cannot separate the directions.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CredentialSubjectMembership {
     pub id: String,
 
     /// Digest of the community-issued VMC this acknowledges, as
-    /// [DTGCredential::digest] computes it.
+    /// [DTGCredential::digest_multibase] computes it.
     ///
     /// REQUIRED on the member-issued VMC, and MUST be omitted on the community-issued VMC.
     /// `Option` rather than two structs because the same property distinguishes the two
     /// directions: a type that could not represent both could not deserialize the pair.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub digest: Option<String>,
+    ///
+    /// Serializes as `digestMultibase`. The Working Draft 01 name `digest` is accepted on
+    /// the wire so that credentials issued against that draft still parse; the *value*
+    /// encoding also changed, so such a credential parses and then fails to compare, with
+    /// [DTGCredentialError::InvalidDigest] rather than a silent mismatch.
+    #[serde(
+        rename = "digestMultibase",
+        alias = "digest",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub digest_multibase: Option<String>,
 }
 
 /// Endorsement Credential subject
@@ -1015,8 +1429,19 @@ pub struct CredentialSubjectEndorsement {
 pub struct CredentialSubjectWitness {
     pub id: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
+    /// Digest of the witnessed edge credential, as [DTGCredential::digest_multibase]
+    /// computes it. REQUIRED by the specification — a VWC without one names the observed
+    /// party and the exchange, but not which edge was witnessed.
+    ///
+    /// Serializes as `digestMultibase`; the Working Draft 01 name `digest` is accepted on
+    /// the wire.
+    #[serde(
+        rename = "digestMultibase",
+        alias = "digest",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub digest_multibase: Option<String>,
 
     /// There is no spec for the witness context content, so we use a generic JSON value
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1057,10 +1482,13 @@ pub struct CredentialSubjectRCard {
 mod tests {
     use crate::{
         CredentialSubject, CredentialSubjectRCard, DTGCommon, DTGCredential, DTGCredentialError,
-        DTGCredentialType, W3CVCVersion, digest_json,
+        DTGCredentialType, W3CVCVersion, decode_digest_multibase, digest_multibase_json,
+        digests_match,
     };
     use chrono::{DateTime, Utc};
+    use multibase::Base;
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn test_vmc_vc_1_deserialize() {
@@ -1323,7 +1751,7 @@ mod tests {
                 "issuer": "did:example:governmentAgencyDid",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "taskContext": "thread-abc-123",
-                "credentialSubject": { "id": "did:example:citizenRDid", "digest": "abcdf", "witnessContext": {} }
+                "credentialSubject": { "id": "did:example:citizenRDid", "digestMultibase": "abcdf", "witnessContext": {} }
             }"#,
         ) {
             Ok(vwc) => vwc,
@@ -1346,7 +1774,7 @@ mod tests {
                 "issuer": "did:example:governmentAgencyDid",
                 "validFrom": "2024-06-18T10:00:00Z",
                 "taskContext": "thread-abc-123",
-                "credentialSubject": { "id": "did:example:citizenRDid", "digest": "abcdf", "wrongContext": {}  }
+                "credentialSubject": { "id": "did:example:citizenRDid", "digestMultibase": "abcdf", "wrongContext": {}  }
             }"#,
         ).is_ok() {
             panic!("Should have failed due to wrong CredentialSubject!");
@@ -1671,7 +2099,7 @@ mod tests {
             valid_from,
             None,
             "thread-abc-123".to_string(),
-            Some(vrc.digest().unwrap()),
+            Some(vrc.digest_multibase().unwrap()),
             None,
         );
 
@@ -1715,11 +2143,11 @@ mod tests {
     }
 
     /// The digest encoding is the interoperability surface: a credential referencing another
-    /// is compared byte-for-byte against a string some other implementation produced. Pinned
-    /// against a literal rather than a recomputation, because a test that recomputes agrees
-    /// with whatever the code does and would follow the encoding silently if it drifted.
+    /// is compared against a value some other implementation produced. Pinned against a
+    /// literal rather than a recomputation, because a test that recomputes agrees with
+    /// whatever the code does and would follow the encoding silently if it drifted.
     #[test]
-    fn test_digest_is_sha256_hex_over_the_proofless_jcs_form() {
+    fn test_digest_is_a_base58btc_multihash_over_the_proofless_jcs_form() {
         let vmc = DTGCredential::new_vmc(
             "did:example:community".to_string(),
             "did:example:member".to_string(),
@@ -1731,29 +2159,102 @@ mod tests {
         )
         .with_id("urn:uuid:2a4e1d90-6e0c-4d3f-9a4a-6d0a8f7c1b52");
 
-        let digest = vmc.digest().unwrap();
+        let digest = vmc.digest_multibase().unwrap();
 
-        let (scheme, hex) = digest.split_once(':').expect("`sha256:` prefixed");
-        assert_eq!(scheme, "sha256");
-        assert_eq!(hex.len(), 64, "32 bytes, hex encoded");
-        assert!(
-            hex.chars()
-                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-            "lowercase hex only, got {hex}"
-        );
+        // Multibase base58btc.
+        assert!(digest.starts_with('z'), "multibase base58btc prefix");
 
-        // Independently computed over the JCS canonical form of the credential above.
-        // Computed outside this crate over the JCS canonical form of the document above:
+        // Decodes to a sha2-256 multihash: 0x12 0x20 followed by 32 digest bytes.
+        let (base, bytes) = multibase::decode(&digest).unwrap();
+        assert_eq!(base, Base::Base58Btc);
+        assert_eq!(bytes.len(), 34);
+        assert_eq!(&bytes[..2], &[0x12, 0x20]);
+
+        // Computed outside this crate over the JCS canonical form of the document below,
+        // then wrapped per CID v1.0 §2.4-2.5:
         //   {"@context":[...],"credentialSubject":{"id":"did:example:member"},
         //    "id":"urn:uuid:2a4e...","issuer":"did:example:community",
         //    "type":[...],"validFrom":"2025-12-11T00:00:00Z"}
-        assert_eq!(
-            digest,
-            "sha256:49c9d5135ab4b5659a343bc79d351e37d64f05add58408cae6eef022828495c2"
-        );
+        // whose SHA-256 is 49c9d5135ab4b5659a343bc79d351e37d64f05add58408cae6eef022828495c2.
+        assert_eq!(digest, "zQmTJgyPT2ShMQ2AvCHGDoPGjEWyRC7ZNT3MBpe5PP6Vpvu");
 
         // Stable across calls.
-        assert_eq!(digest, vmc.digest().unwrap());
+        assert_eq!(digest, vmc.digest_multibase().unwrap());
+    }
+
+    /// The superseded encoding still produces what it always did, so a caller migrating can
+    /// recompute a Working Draft 01 digest to compare against one they stored.
+    #[test]
+    #[allow(deprecated)]
+    fn the_superseded_hex_digest_is_unchanged() {
+        let vmc = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            None,
+            false,
+        )
+        .with_id("urn:uuid:2a4e1d90-6e0c-4d3f-9a4a-6d0a8f7c1b52");
+
+        assert_eq!(
+            vmc.digest().unwrap(),
+            "sha256:49c9d5135ab4b5659a343bc79d351e37d64f05add58408cae6eef022828495c2"
+        );
+    }
+
+    /// A Working Draft 01 digest reaching a Working Draft 02 verifier is *reported*, not
+    /// silently treated as a mismatch. The two say different things: one is a credential
+    /// that disagrees, the other a credential that cannot be read at all.
+    #[test]
+    fn a_superseded_digest_value_is_rejected_as_malformed() {
+        let err = decode_digest_multibase(
+            "sha256:49c9d5135ab4b5659a343bc79d351e37d64f05add58408cae6eef022828495c2",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DTGCredentialError::InvalidDigest(_)),
+            "expected InvalidDigest, got {err:?}"
+        );
+    }
+
+    /// Digests are compared as decoded bytes, never as strings — the specification requires
+    /// it, because one digest has more than one spelling.
+    #[test]
+    fn digests_are_compared_by_bytes_not_by_string() {
+        // The same sha2-256 multihash, encoded base58btc and base16. Identical bytes,
+        // different strings.
+        let multihash = {
+            let mut v = vec![0x12u8, 0x20];
+            v.extend_from_slice(&Sha256::digest(b"an edge credential"));
+            v
+        };
+        let b58 = multibase::encode(Base::Base58Btc, &multihash);
+        let b16 = multibase::encode(Base::Base16Lower, &multihash);
+
+        assert_ne!(b58, b16, "the two spellings differ as strings");
+        assert!(
+            digests_match(&b58, &b16).unwrap(),
+            "but name the same digest"
+        );
+    }
+
+    /// An algorithm the library does not implement is *rejected*, not reported as a
+    /// mismatch. A verifier that conflated the two would silently downgrade a governing
+    /// party's choice of a stronger hash into a failed comparison.
+    #[test]
+    fn an_unaccepted_hash_algorithm_is_rejected_rather_than_mismatched() {
+        // 0x13 is sha2-512 in the multicodec table.
+        let mut multihash = vec![0x13u8, 0x40];
+        multihash.extend_from_slice(&[0u8; 64]);
+        let encoded = multibase::encode(Base::Base58Btc, &multihash);
+
+        assert!(matches!(
+            decode_digest_multibase(&encoded),
+            Err(DTGCredentialError::UnsupportedDigestAlgorithm(0x13))
+        ));
     }
 
     /// The digest binds to what a credential says, not to a signature over it, so a
@@ -1774,10 +2275,10 @@ mod tests {
             false,
         );
 
-        let before = vmc.digest().unwrap();
+        let before = vmc.digest_multibase().unwrap();
         vmc.sign(&secret, None).await.expect("signs");
         assert!(vmc.signed());
-        assert_eq!(before, vmc.digest().unwrap());
+        assert_eq!(before, vmc.digest_multibase().unwrap());
     }
 
     /// A grant in the wire form a member actually receives.
@@ -1809,7 +2310,10 @@ mod tests {
 
         // The grant MUST omit the digest; the acknowledgement MUST carry it.
         assert_eq!(grant.subject_digest(), None);
-        assert_eq!(ack.subject_digest(), Some(grant.digest().unwrap().as_str()));
+        assert_eq!(
+            ack.subject_digest(),
+            Some(grant.digest_multibase().unwrap().as_str())
+        );
 
         assert!(ack.acknowledges(&grant).unwrap());
     }
@@ -1872,19 +2376,11 @@ mod tests {
         assert!(!grant.acknowledges(&grant).unwrap());
     }
 
-    /// The bug this API shape exists to prevent.
-    ///
-    /// A real grant carries `credentialStatus` — every VMC issued against a status list
-    /// does — and `DTGCommon` does not model it, so a parse-then-re-serialise round trip
-    /// drops it. An acknowledgement built by digesting the *parsed* grant would carry a
-    /// digest over a document the community never issued, and the community would
-    /// rightly refuse it. Silently: both credentials verify, and only the digest
-    /// comparison fails, with nothing to say why.
-    ///
-    /// So `new_member_vmc` takes the wire form, and this pins that it digests what it
-    /// was handed rather than what it could parse.
+    /// `credentialStatus` used to be dropped by a parse-then-re-serialise round trip, which
+    /// silently changed a credential's digest. [`DTGCommon::credential_status`] models it,
+    /// and this pins that it survives.
     #[test]
-    fn the_acknowledgement_digests_members_the_model_does_not_know() {
+    fn credential_status_survives_a_round_trip() {
         let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -1896,40 +2392,116 @@ mod tests {
             None,
             false,
         ));
-        grant["credentialStatus"] = serde_json::json!({
+        let status = serde_json::json!({
             "id": "https://community.example/status#7",
             "type": "BitstringStatusListEntry",
             "statusPurpose": "revocation",
             "statusListIndex": "7"
         });
+        grant["credentialStatus"] = status.clone();
 
-        // The parse drops it — this is the hazard, asserted rather than assumed.
         let parsed: DTGCredential = serde_json::from_value(grant.clone()).expect("parses");
-        assert!(
-            wire(&parsed).get("credentialStatus").is_none(),
-            "the model is expected NOT to carry credentialStatus; if it now does, this \
-             test has stopped guarding anything and the API can be simplified"
+        assert_eq!(
+            parsed.credential().credential_status.as_ref(),
+            Some(&status)
+        );
+        assert_eq!(wire(&parsed).get("credentialStatus"), Some(&status));
+        assert_eq!(
+            parsed.digest_multibase().unwrap(),
+            digest_multibase_json(&grant).unwrap(),
+            "the digest must not change under a round trip that preserves every member"
+        );
+    }
+
+    /// Top-level members this library does not model at all are preserved too, by
+    /// [`DTGCommon::extra`]. `credentialSchema` stands in for the open set of them.
+    #[test]
+    fn unmodelled_top_level_members_survive_a_round_trip() {
+        let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut grant = wire(&DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            valid_from,
+            None,
+            false,
+        ));
+        let schema = serde_json::json!({
+            "id": "https://community.example/schemas/vmc",
+            "type": "JsonSchema"
+        });
+        grant["credentialSchema"] = schema.clone();
+
+        let parsed: DTGCredential = serde_json::from_value(grant.clone()).expect("parses");
+        assert_eq!(
+            parsed.credential().extra.get("credentialSchema"),
+            Some(&schema)
+        );
+        assert_eq!(
+            parsed.digest_multibase().unwrap(),
+            digest_multibase_json(&grant).unwrap()
+        );
+    }
+
+    /// # Why the wire form is still what gets digested
+    ///
+    /// [`DTGCommon::extra`] closed the dropped-member hazard, but not the whole of it. A
+    /// timestamp is *normalized* on the way out — `2025-12-11T00:00:00.000+00:00` and
+    /// `2025-12-11T00:00:00Z` are the same instant and parse to the same
+    /// [`chrono::DateTime`], and this library re-serializes both as the latter. The
+    /// document that comes back out is therefore equivalent to the one that went in, and
+    /// hashes differently.
+    ///
+    /// An acknowledgement built by digesting the *parsed* grant would carry a digest over a
+    /// document the community never issued, and the community would rightly refuse it.
+    /// Silently: both credentials verify, and only the digest comparison fails, with
+    /// nothing to say why.
+    ///
+    /// So `new_member_vmc` takes the wire form, and this pins that it digests what it was
+    /// handed rather than what it could parse.
+    #[test]
+    fn the_acknowledgement_digests_the_grant_as_it_arrived() {
+        let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut grant = wire(&DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            valid_from,
+            None,
+            false,
+        ));
+        // The same instant, spelled the way another implementation might.
+        grant["validFrom"] = Value::String("2025-12-11T00:00:00.000+00:00".to_string());
+
+        // The parse normalizes it — this is the hazard, asserted rather than assumed.
+        let parsed: DTGCredential = serde_json::from_value(grant.clone()).expect("parses");
+        assert_ne!(
+            wire(&parsed).get("validFrom"),
+            grant.get("validFrom"),
+            "the model is expected to normalize the timestamp; if it now round-trips \
+             verbatim, this test has stopped guarding anything"
         );
 
         let ack = DTGCredential::new_member_vmc(&grant, valid_from, None).expect("builds");
 
         assert_eq!(
             ack.subject_digest(),
-            Some(digest_json(&grant).unwrap().as_str()),
+            Some(digest_multibase_json(&grant).unwrap().as_str()),
             "the acknowledgement must digest the grant as received"
         );
         assert_ne!(
             ack.subject_digest(),
-            Some(parsed.digest().unwrap().as_str()),
+            Some(parsed.digest_multibase().unwrap().as_str()),
             "digesting the parsed model would produce a digest the community cannot match"
         );
     }
 
-    /// `digest_json` and `digest` must agree for a credential with nothing outside the
-    /// model — otherwise the two entry points would quietly disagree for the easy case
-    /// too, and no caller could tell which to trust.
     #[test]
-    fn digest_json_agrees_with_digest_where_the_model_is_complete() {
+    fn digest_multibase_json_agrees_with_digest_where_the_model_is_complete() {
         let vmc = DTGCredential::new_vmc(
             "did:example:community".to_string(),
             "did:example:member".to_string(),
@@ -1941,7 +2513,10 @@ mod tests {
         )
         .with_id("urn:uuid:2a4e1d90-6e0c-4d3f-9a4a-6d0a8f7c1b52");
 
-        assert_eq!(vmc.digest().unwrap(), digest_json(&wire(&vmc)).unwrap());
+        assert_eq!(
+            vmc.digest_multibase().unwrap(),
+            digest_multibase_json(&wire(&vmc)).unwrap()
+        );
     }
 
     /// `acknowledges` answers only about VMC pairs. A VRC edge is completed by its own
@@ -1976,7 +2551,7 @@ mod tests {
             valid_from,
             None,
             "thread-abc-123".to_string(),
-            Some(grant.digest().unwrap()),
+            Some(grant.digest_multibase().unwrap()),
             None,
         );
         assert!(vwc.verify_digest(&grant).unwrap(), "the digest does match");
@@ -2034,7 +2609,7 @@ mod tests {
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": {
                     "id": "did:example:community",
-                    "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    "digestMultibase": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                 }
             }"#,
         )
@@ -2064,7 +2639,7 @@ mod tests {
                 "validFrom": "2024-06-18T10:00:00Z",
                 "credentialSubject": {
                     "id": "did:example:community",
-                    "digest": "sha256:e3b0c4",
+                    "digestMultibase": "sha256:e3b0c4",
                     "witnessContext": { "event": "not a membership property" }
                 }
             }"#,
@@ -2072,7 +2647,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// The two halves must be distinguishable on the wire by `digest` alone — that is the
+    /// The two halves must be distinguishable on the wire by `digestMultibase` alone — that is the
     /// only discriminator where both endpoints are C-DIDs, as in VTN membership.
     #[test]
     fn test_the_two_halves_round_trip_over_the_wire() {
@@ -2091,14 +2666,16 @@ mod tests {
 
         let grant_json = serde_json::to_value(&grant).unwrap();
         assert!(
-            grant_json["credentialSubject"].get("digest").is_none(),
-            "the grant MUST omit `digest`: {grant_json}"
+            grant_json["credentialSubject"]
+                .get("digestMultibase")
+                .is_none(),
+            "the grant MUST omit `digestMultibase`: {grant_json}"
         );
 
         let ack_json = serde_json::to_value(&ack).unwrap();
         assert_eq!(
-            ack_json["credentialSubject"]["digest"],
-            Value::String(grant.digest().unwrap()),
+            ack_json["credentialSubject"]["digestMultibase"],
+            Value::String(grant.digest_multibase().unwrap()),
         );
 
         // And the pair still binds after a round trip through JSON, which is how each side
