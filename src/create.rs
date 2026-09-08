@@ -5,9 +5,9 @@
 #[allow(deprecated)]
 use crate::{
     AuthorityGrant, CredentialSubject, CredentialSubjectAuthority, CredentialSubjectBasic,
-    CredentialSubjectEndorsement, CredentialSubjectMembership, CredentialSubjectRCard,
-    CredentialSubjectWitness, DTGCommon, DTGCredential, DTGCredentialError, DTGCredentialType,
-    WitnessContext,
+    CredentialSubjectDelegation, CredentialSubjectEndorsement, CredentialSubjectMembership,
+    CredentialSubjectRCard, CredentialSubjectWitness, DTGCommon, DTGCredential, DTGCredentialError,
+    DTGCredentialType, DelegationGrant, WitnessContext,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -22,11 +22,11 @@ impl DTGCredential {
     /// but it cannot produce the acknowledgement without that party's signature. The pair
     /// is what makes an unconsented membership claim unprovable.
     ///
-    /// The grant MUST NOT carry a `digest` — that property is what marks the other
-    /// direction — and this constructor does not set one.
+    /// The grant MUST NOT carry a `digestMultibase` — that property is what marks the
+    /// other direction — and this constructor does not set one.
     ///
-    /// issuer: The C-DID of the VTC or VTN granting membership
-    /// subject: The M-DID of the member, or the member VTC's C-DID for VTN membership
+    /// issuer: The identifier of the VTC or VTN granting membership
+    /// subject: The member's identifier, or the member VTC's own for VTN membership
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
     /// personhood: Whether this VMC can be used as a form of Personhood Credential
@@ -49,7 +49,7 @@ impl DTGCredential {
             valid_until,
             credential_subject: CredentialSubject::Membership(CredentialSubjectMembership {
                 id: subject,
-                digest: None,
+                digest_multibase: None,
             }),
             ..Default::default()
         };
@@ -71,7 +71,8 @@ impl DTGCredential {
     /// **acknowledgement**, the member → community half of a membership edge.
     ///
     /// The roles of [DTGCredential::new_vmc] are reversed (the member issues, the community
-    /// is the subject) and the subject carries a `digest` of the grant being acknowledged.
+    /// is the subject) and the subject carries a `digestMultibase` of the grant being
+    /// acknowledged.
     /// That digest is what binds the two halves into one edge: an acknowledgement whose
     /// digest matches no valid grant does not complete anything, and the binding forces an
     /// order — the grant must exist before this can reference it.
@@ -135,10 +136,14 @@ impl DTGCredential {
                 DTGCredentialError::NotAMembershipGrant("no `credentialSubject`".into())
             })?;
 
-        if subject.contains_key("digest") {
+        // Both spellings: `digestMultibase` is the Working Draft 02 name, `digest` the
+        // Working Draft 01 one this library also accepts on the wire. Probing only the
+        // current name would let an acknowledgement issued against the older draft be
+        // acknowledged in turn, which forms no edge.
+        if subject.contains_key("digestMultibase") || subject.contains_key("digest") {
             return Err(DTGCredentialError::NotAMembershipGrant(
-                "the credential carries a `digest`, so it is itself a member-issued \
-                 acknowledgement rather than a community-issued grant"
+                "the credential carries a digest of another credential, so it is itself a \
+                 member-issued acknowledgement rather than a community-issued grant"
                     .into(),
             ));
         }
@@ -171,7 +176,7 @@ impl DTGCredential {
             valid_until,
             credential_subject: CredentialSubject::Membership(CredentialSubjectMembership {
                 id: community,
-                digest: Some(crate::digest_json(grant)?),
+                digest_multibase: Some(crate::digest_multibase_json(grant)?),
             }),
             ..Default::default()
         };
@@ -250,14 +255,19 @@ impl DTGCredential {
     ///
     /// `actions` MUST NOT be empty — an empty list confers nothing rather than everything.
     ///
-    /// Tracks a draft (`trustoverip/dtgwg-cred-spec` PR #29); the shape may move.
+    /// # `valid_until` is required
+    ///
+    /// Not optional, unlike the base structure and unlike every other `new_*` constructor
+    /// here. Nothing about the subject's current standing is consulted when a VAC is
+    /// verified, so authority that does not expire is authority nobody can withdraw by
+    /// waiting.
     pub fn new_vac(
         issuer: String,
         subject: String,
         scope: String,
         actions: Vec<String>,
         valid_from: DateTime<Utc>,
-        valid_until: Option<DateTime<Utc>>,
+        valid_until: DateTime<Utc>,
     ) -> Result<Self, DTGCredentialError> {
         if actions.is_empty() {
             return Err(DTGCredentialError::EmptyAuthorityActions);
@@ -265,7 +275,7 @@ impl DTGCredential {
         let mut vac = DTGCommon {
             issuer,
             valid_from,
-            valid_until,
+            valid_until: Some(valid_until),
             credential_subject: CredentialSubject::Authority(CredentialSubjectAuthority {
                 id: subject,
                 authority: AuthorityGrant {
@@ -292,7 +302,8 @@ impl DTGCredential {
     /// This is what lets a member equip an agent, a device, or a short-lived session with
     /// only the authority that task needs, rather than lending it their own. The derived
     /// credential is issued by the *holder*, not by the party governing the scope, and
-    /// carries `parent` so a verifier can walk back to a root.
+    /// carries `parent` — the **digest** of the credential it narrows — so a verifier can
+    /// walk back to a root.
     ///
     /// Refuses anything that would widen. The checks here mirror
     /// [crate::authority::verify_chain] on purpose: a holder should be unable to *build* a
@@ -300,18 +311,25 @@ impl DTGCredential {
     /// use — but the verifier's checks remain authoritative, because nothing stops a
     /// different implementation constructing the JSON by hand.
     ///
-    /// - `self` must be a VAC, and must carry an `id` (a parent with no identifier cannot
-    ///   be pointed at).
+    /// - `self` must be a VAC.
     /// - `actions` must be a subset of what `self` confers.
     /// - `valid_until` must not exceed `self`'s.
     /// - `audience` binds the derived credential to one presenter; strongly recommended
     ///   when equipping an agent, since it makes a leaked credential useless to anyone else.
+    ///
+    /// # Digests the model
+    ///
+    /// The `parent` digest is computed with [DTGCredential::digest_multibase], which hashes
+    /// this in-memory credential. That is right for a VAC this process built and signed.
+    /// For one that **arrived from a counterparty**, use
+    /// [DTGCredential::attenuate_from_json] and give it the bytes you received — the same
+    /// distinction [DTGCredential::new_member_vmc] draws, and for the same reason.
     pub fn attenuate(
         &self,
         subject: String,
         actions: Vec<String>,
         valid_from: DateTime<Utc>,
-        valid_until: Option<DateTime<Utc>>,
+        valid_until: DateTime<Utc>,
         audience: Option<String>,
     ) -> Result<Self, DTGCredentialError> {
         let parent_grant = self
@@ -319,11 +337,111 @@ impl DTGCredential {
             .authority()
             .ok_or(DTGCredentialError::NotAnAuthorityCredential)?;
 
-        let parent_id = self
-            .id()
-            .ok_or(DTGCredentialError::AttenuationParentHasNoId)?
+        Self::attenuate_inner(
+            parent_grant.clone(),
+            self.credential().subject().to_string(),
+            self.credential().valid_until(),
+            self.digest_multibase()?,
+            subject,
+            actions,
+            valid_from,
+            valid_until,
+            audience,
+        )
+    }
+
+    /// Derive a narrower VAC from a parent in its **wire form**.
+    ///
+    /// Identical to [DTGCredential::attenuate] except that the parent is the JSON a
+    /// counterparty sent rather than a parsed credential, so the `parent` digest covers
+    /// the document the verifier will recompute it over. Use this whenever the VAC being
+    /// narrowed came from somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::NotAnAuthorityCredential] if `parent` is not a JSON object
+    /// carrying `AuthorityCredential` in its `type` and a well-formed
+    /// `credentialSubject.authority`, and the same widening errors as
+    /// [DTGCredential::attenuate].
+    pub fn attenuate_from_json(
+        parent: &Value,
+        subject: String,
+        actions: Vec<String>,
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+        audience: Option<String>,
+    ) -> Result<Self, DTGCredentialError> {
+        let object = parent
+            .as_object()
+            .ok_or(DTGCredentialError::NotAnAuthorityCredential)?;
+
+        let is_authority = object
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|types| {
+                types
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|t| t == "AuthorityCredential")
+            });
+        if !is_authority {
+            return Err(DTGCredentialError::NotAnAuthorityCredential);
+        }
+
+        let parent_subject = object
+            .get("credentialSubject")
+            .and_then(Value::as_object)
+            .ok_or(DTGCredentialError::NotAnAuthorityCredential)?;
+
+        // The holder attenuating is the parent's subject; reading it off the parent is what
+        // keeps a derived VAC from citing a chain its issuer never held.
+        let holder = parent_subject
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(DTGCredentialError::NotAnAuthorityCredential)?
             .to_string();
 
+        let parent_grant: AuthorityGrant = parent_subject
+            .get("authority")
+            .ok_or(DTGCredentialError::NotAnAuthorityCredential)
+            .and_then(|a| {
+                serde_json::from_value(a.clone())
+                    .map_err(|_| DTGCredentialError::NotAnAuthorityCredential)
+            })?;
+
+        let parent_until = object
+            .get("validUntil")
+            .or_else(|| object.get("expirationDate"))
+            .and_then(Value::as_str)
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc));
+
+        Self::attenuate_inner(
+            parent_grant,
+            holder,
+            parent_until,
+            crate::digest_multibase_json(parent)?,
+            subject,
+            actions,
+            valid_from,
+            valid_until,
+            audience,
+        )
+    }
+
+    /// The narrowing checks and the assembly, shared by both attenuation entry points.
+    #[allow(clippy::too_many_arguments)]
+    fn attenuate_inner(
+        parent_grant: AuthorityGrant,
+        holder: String,
+        parent_until: Option<DateTime<Utc>>,
+        parent_digest: String,
+        subject: String,
+        actions: Vec<String>,
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+        audience: Option<String>,
+    ) -> Result<Self, DTGCredentialError> {
         if actions.is_empty() {
             return Err(DTGCredentialError::EmptyAuthorityActions);
         }
@@ -334,26 +452,26 @@ impl DTGCredential {
                 )));
             }
         }
-        if let (Some(until), Some(parent_until)) = (valid_until, self.credential().valid_until())
-            && until > parent_until
+        if let Some(parent_until) = parent_until
+            && valid_until > parent_until
         {
             return Err(DTGCredentialError::AttenuationWidens(format!(
-                "validUntil {until} is beyond the parent's {parent_until}"
+                "validUntil {valid_until} is beyond the parent's {parent_until}"
             )));
         }
 
         let mut vac = DTGCommon {
             // The holder issues: they are the subject of the parent grant.
-            issuer: self.credential().subject().to_string(),
+            issuer: holder,
             valid_from,
-            valid_until,
+            valid_until: Some(valid_until),
             credential_subject: CredentialSubject::Authority(CredentialSubjectAuthority {
                 id: subject,
                 authority: AuthorityGrant {
                     // Scope never changes down a chain.
                     scope: parent_grant.scope.clone(),
                     actions,
-                    parent: Some(parent_id),
+                    parent: Some(parent_digest),
                     audience,
                 },
             }),
@@ -369,34 +487,416 @@ impl DTGCredential {
         })
     }
 
-    /// Creates a new Verifiable Delegation Credential (VDC).
+    /// Creates a new Verifiable Delegation Credential (VDC) — the delegation **grant**,
+    /// the delegator → delegate half of a delegation edge.
     ///
-    /// Establishes that `subject` may act **in the issuer's name**. This is not authority:
-    /// a VDC never supplies permission the delegator did not itself hold, and a verifier
-    /// must settle the two questions separately. See [DTGCredential::new_vac].
+    /// Establishes that `subject` may act **in the issuer's name**, for the acts named in
+    /// `scope`, until `valid_until`. Within that scope what the delegate does is
+    /// attributable to the delegator.
     ///
-    /// Tracks a draft (`trustoverip/dtgwg-cred-spec` PR #19); the shape may move.
+    /// # This is not authority
+    ///
+    /// A VDC never supplies permission the delegator did not itself hold. A verifier
+    /// substitutes the delegator for the delegate and then asks the permission question it
+    /// would have asked of the delegator directly — so withdrawing the delegator's own
+    /// permission ends the delegate's ability to act immediately, without revoking
+    /// anything. See [DTGCredential::new_vac] for the credential that answers that
+    /// question.
+    ///
+    /// # The edge is not complete without the acceptance
+    ///
+    /// This is one half. The delegate answers with [DTGCredential::new_delegate_vdc], and
+    /// a verifier MUST obtain and verify that half before accepting any party as acting
+    /// under the delegation: a grant alone establishes what the delegator appointed, not
+    /// what the delegate agreed to. Same consent rule as a membership edge, and for the
+    /// same reason — a delegator can always name someone as its delegate, but cannot
+    /// produce the countersignature.
+    ///
+    /// `scope` MUST NOT be empty: a VDC cannot express an unbounded appointment by
+    /// omitting it.
+    ///
+    /// `max_depth` is the number of further re-delegations permitted below this one.
+    /// `None` and `Some(0)` both prohibit re-delegation — the default is a single hop, and
+    /// setting it above zero is the delegator's explicit authorisation, of which there is
+    /// no other kind.
+    ///
+    /// # `valid_until` is required
+    ///
+    /// An appointment with no expiry cannot be reasoned about by a verifier that cannot
+    /// reach the delegator.
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::MalformedDelegation] if `scope` is empty.
     pub fn new_vdc(
         issuer: String,
         subject: String,
         valid_from: DateTime<Utc>,
-        valid_until: Option<DateTime<Utc>>,
-    ) -> Self {
+        valid_until: DateTime<Utc>,
+        scope: Vec<String>,
+        max_depth: Option<u32>,
+    ) -> Result<Self, DTGCredentialError> {
+        if scope.is_empty() {
+            return Err(DTGCredentialError::MalformedDelegation(
+                "a grant MUST carry at least one `scope` entry — a VDC cannot express an \
+                 unbounded appointment by emptying it"
+                    .into(),
+            ));
+        }
+
         let mut vdc = DTGCommon {
             issuer,
             valid_from,
-            valid_until,
-            credential_subject: CredentialSubject::Basic(CredentialSubjectBasic { id: subject }),
+            valid_until: Some(valid_until),
+            credential_subject: CredentialSubject::Delegation(CredentialSubjectDelegation {
+                id: subject,
+                delegation: DelegationGrant {
+                    scope: Some(scope),
+                    parent: None,
+                    max_depth,
+                    accepts: None,
+                },
+            }),
             ..Default::default()
         };
 
         vdc.type_.push(DTGCredentialType::Delegation.to_string());
 
-        DTGCredential {
+        Ok(DTGCredential {
             credential: vdc,
             type_: DTGCredentialType::Delegation,
             version: crate::W3CVCVersion::V2_0,
+        })
+    }
+
+    /// Derive a further VDC from one this delegate already holds — a **re-delegation**.
+    ///
+    /// Only permitted where the held VDC sets `maxDepth` above zero, and only for a subset
+    /// of the acts it was itself appointed for. The default is a single hop: a delegate
+    /// that needs a further delegate and is not authorised to re-delegate asks the
+    /// principal, who issues a fresh root delegation directly — so that the principal
+    /// always holds the complete register of who may speak in its name.
+    ///
+    /// The derived VDC carries `parent`, the digest of the VDC it derives from, and a
+    /// `maxDepth` one less than its parent's.
+    ///
+    /// Like [DTGCredential::attenuate], this digests the in-memory model; for a grant that
+    /// arrived from a counterparty, use [DTGCredential::redelegate_from_json].
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::MalformedDelegation] if `self` is not a delegation grant, if
+    /// it does not permit re-delegation, if `scope` is empty or not a subset of the
+    /// parent's, or if `valid_until` is later than the parent's.
+    pub fn redelegate(
+        &self,
+        subject: String,
+        scope: Vec<String>,
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> Result<Self, DTGCredentialError> {
+        let parent = self.credential().delegation().ok_or_else(|| {
+            DTGCredentialError::MalformedDelegation("not a DelegationCredential".into())
+        })?;
+
+        Self::redelegate_inner(
+            parent.clone(),
+            self.credential().subject().to_string(),
+            self.credential().valid_until(),
+            self.digest_multibase()?,
+            subject,
+            scope,
+            valid_from,
+            valid_until,
+        )
+    }
+
+    /// Derive a further VDC from a parent grant in its **wire form**.
+    ///
+    /// Identical to [DTGCredential::redelegate] except that the parent is the JSON the
+    /// delegator sent, so the `parent` digest covers the document a verifier will
+    /// recompute it over.
+    pub fn redelegate_from_json(
+        parent: &Value,
+        subject: String,
+        scope: Vec<String>,
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> Result<Self, DTGCredentialError> {
+        let (delegate, grant, parent_until) = Self::read_delegation_json(parent)?;
+
+        Self::redelegate_inner(
+            grant,
+            delegate,
+            parent_until,
+            crate::digest_multibase_json(parent)?,
+            subject,
+            scope,
+            valid_from,
+            valid_until,
+        )
+    }
+
+    /// The narrowing checks and the assembly, shared by both re-delegation entry points.
+    #[allow(clippy::too_many_arguments)]
+    fn redelegate_inner(
+        parent_grant: DelegationGrant,
+        holder: String,
+        parent_until: Option<DateTime<Utc>>,
+        parent_digest: String,
+        subject: String,
+        scope: Vec<String>,
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> Result<Self, DTGCredentialError> {
+        if parent_grant.accepts.is_some() {
+            return Err(DTGCredentialError::MalformedDelegation(
+                "the parent is an acceptance, not a grant — an acceptance appoints nobody \
+                 and cannot be re-delegated from"
+                    .into(),
+            ));
         }
+
+        // Absence prohibits re-delegation just as `0` does. This is the opposite default
+        // from a VAC, deliberately: a delegate speaks in the principal's name, so the
+        // principal keeps the register of who may do so.
+        let parent_depth = parent_grant.max_depth.unwrap_or(0);
+        if parent_depth == 0 {
+            return Err(DTGCredentialError::MalformedDelegation(
+                "the parent does not permit re-delegation — `maxDepth` is absent or zero, \
+                 and setting it above zero is the delegator's only way to authorise one"
+                    .into(),
+            ));
+        }
+
+        if scope.is_empty() {
+            return Err(DTGCredentialError::MalformedDelegation(
+                "a grant MUST carry at least one `scope` entry".into(),
+            ));
+        }
+        let parent_scope = parent_grant.scope.as_deref().unwrap_or(&[]);
+        for act in &scope {
+            if !parent_scope.contains(act) {
+                return Err(DTGCredentialError::MalformedDelegation(format!(
+                    "`{act}` is not in the scope this delegation derives from"
+                )));
+            }
+        }
+        if let Some(parent_until) = parent_until
+            && valid_until > parent_until
+        {
+            return Err(DTGCredentialError::MalformedDelegation(format!(
+                "validUntil {valid_until} is beyond the parent's {parent_until}"
+            )));
+        }
+
+        let mut vdc = DTGCommon {
+            issuer: holder,
+            valid_from,
+            valid_until: Some(valid_until),
+            credential_subject: CredentialSubject::Delegation(CredentialSubjectDelegation {
+                id: subject,
+                delegation: DelegationGrant {
+                    scope: Some(scope),
+                    parent: Some(parent_digest),
+                    max_depth: Some(parent_depth - 1),
+                    accepts: None,
+                },
+            }),
+            ..Default::default()
+        };
+
+        vdc.type_.push(DTGCredentialType::Delegation.to_string());
+
+        Ok(DTGCredential {
+            credential: vdc,
+            type_: DTGCredentialType::Delegation,
+            version: crate::W3CVCVersion::V2_0,
+        })
+    }
+
+    /// Creates the delegate-issued half of a delegation edge — the **acceptance**.
+    ///
+    /// The roles of [DTGCredential::new_vdc] are reversed (the delegate issues, the
+    /// delegator is the subject) and the subject carries `accepts`, the digest of the
+    /// grant being taken on. That digest is what binds the two halves into one edge.
+    ///
+    /// An acceptance carries no `scope` of its own. What the delegate consented to is the
+    /// scope of the grant it names, which a verifier holds in any case; restating it would
+    /// require an equality check across the two credentials that cannot be satisfied under
+    /// selective disclosure of either.
+    ///
+    /// This is the delegate's consent artifact, and its accountability for acting in
+    /// another's name. Because a delegator cannot produce it, a party holding only the
+    /// delegate's key cannot manufacture appointments either.
+    ///
+    /// # Takes the grant in its wire form, deliberately
+    ///
+    /// Same reasoning as [DTGCredential::new_member_vmc]: the digest has to cover the
+    /// document the delegator will recompute it over. Keep the bytes you were given and
+    /// pass them here.
+    ///
+    /// # Errors
+    ///
+    /// [DTGCredentialError::NotADelegationGrant] if `grant` is not a JSON object carrying
+    /// `DelegationCredential` in its `type`, has no `issuer` or `credentialSubject.id`, or
+    /// already carries `accepts` — that last is itself an acceptance, and accepting one
+    /// forms no edge.
+    pub fn new_delegate_vdc(
+        grant: &Value,
+        valid_from: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> Result<Self, DTGCredentialError> {
+        let object = grant
+            .as_object()
+            .ok_or_else(|| DTGCredentialError::NotADelegationGrant("not a JSON object".into()))?;
+
+        let is_delegation = object
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|types| {
+                types
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|t| t == "DelegationCredential")
+            });
+        if !is_delegation {
+            return Err(DTGCredentialError::NotADelegationGrant(
+                "`type` does not include `DelegationCredential`".into(),
+            ));
+        }
+
+        let subject = object
+            .get("credentialSubject")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                DTGCredentialError::NotADelegationGrant("no `credentialSubject`".into())
+            })?;
+
+        let delegation = subject
+            .get("delegation")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                DTGCredentialError::NotADelegationGrant("no `credentialSubject.delegation`".into())
+            })?;
+
+        if delegation.contains_key("accepts") {
+            return Err(DTGCredentialError::NotADelegationGrant(
+                "the credential carries `accepts`, so it is itself an acceptance rather \
+                 than a grant"
+                    .into(),
+            ));
+        }
+        if !delegation.contains_key("scope") {
+            return Err(DTGCredentialError::NotADelegationGrant(
+                "the grant carries no `scope`, so there is no appointment to accept".into(),
+            ));
+        }
+
+        // The delegate is the grant's subject and the delegator its issuer. Reading both
+        // off the grant is what keeps the two halves naming the same pair — taking them as
+        // parameters would let a caller accept one grant while naming the parties of
+        // another, which verifies as a digest match and means nothing.
+        let delegate = subject
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                DTGCredentialError::NotADelegationGrant("no `credentialSubject.id`".into())
+            })?
+            .to_string();
+
+        // `issuer` is a string or an object with an `id`, per the W3C data model.
+        let delegator = object
+            .get("issuer")
+            .and_then(|i| {
+                i.as_str()
+                    .map(str::to_string)
+                    .or_else(|| i.get("id").and_then(Value::as_str).map(str::to_string))
+            })
+            .ok_or_else(|| DTGCredentialError::NotADelegationGrant("no `issuer`".into()))?;
+
+        let mut vdc = DTGCommon {
+            issuer: delegate,
+            valid_from,
+            valid_until: Some(valid_until),
+            credential_subject: CredentialSubject::Delegation(CredentialSubjectDelegation {
+                id: delegator,
+                delegation: DelegationGrant {
+                    scope: None,
+                    parent: None,
+                    max_depth: None,
+                    accepts: Some(crate::digest_multibase_json(grant)?),
+                },
+            }),
+            ..Default::default()
+        };
+
+        vdc.type_.push(DTGCredentialType::Delegation.to_string());
+
+        Ok(DTGCredential {
+            credential: vdc,
+            type_: DTGCredentialType::Delegation,
+            version: crate::W3CVCVersion::V2_0,
+        })
+    }
+
+    /// Reads the delegate, the grant, and the parent's expiry off a VDC in its wire form.
+    fn read_delegation_json(
+        doc: &Value,
+    ) -> Result<(String, DelegationGrant, Option<DateTime<Utc>>), DTGCredentialError> {
+        let object = doc
+            .as_object()
+            .ok_or_else(|| DTGCredentialError::MalformedDelegation("not a JSON object".into()))?;
+
+        let is_delegation = object
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|types| {
+                types
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|t| t == "DelegationCredential")
+            });
+        if !is_delegation {
+            return Err(DTGCredentialError::MalformedDelegation(
+                "`type` does not include `DelegationCredential`".into(),
+            ));
+        }
+
+        let subject = object
+            .get("credentialSubject")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                DTGCredentialError::MalformedDelegation("no `credentialSubject`".into())
+            })?;
+
+        let delegate = subject
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                DTGCredentialError::MalformedDelegation("no `credentialSubject.id`".into())
+            })?
+            .to_string();
+
+        let grant: DelegationGrant = subject
+            .get("delegation")
+            .ok_or_else(|| {
+                DTGCredentialError::MalformedDelegation("no `credentialSubject.delegation`".into())
+            })
+            .and_then(|d| {
+                serde_json::from_value(d.clone()).map_err(|e| {
+                    DTGCredentialError::MalformedDelegation(format!("malformed `delegation`: {e}"))
+                })
+            })?;
+
+        let until = object
+            .get("validUntil")
+            .or_else(|| object.get("expirationDate"))
+            .and_then(Value::as_str)
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc));
+
+        Ok((delegate, grant, until))
     }
 
     /// Creates a new Verified Persona Credential (VPC)
@@ -461,17 +961,18 @@ impl DTGCredential {
     }
 
     /// Creates a new Verified Witness Credential (VWC)
-    /// issuer: The issuer DID of the credential - an M-DID, or the DID of a VTA acting
-    ///         according to VTC policy
+    /// issuer: The issuer DID of the credential - a member's identifier, or the DID of a
+    ///         VTA acting according to VTC policy
     /// subject: The DID of the observed party. For a witnessed bi-directional exchange this
     ///          MUST be the issuer of the VRC that this VWC attests (the VRC referenced by
-    ///          `digest`), so that the two VWCs of an exchange are unambiguously bound to
+    ///          `digestMultibase`), so that the two VWCs of an exchange are unambiguously bound to
     ///          their respective directions. The witness should issue one VWC per direction.
     /// valid_from: The datetime from which this credential is valid
     /// valid_until: Optional: The datetime this credential is valid until
     /// task_context: Required `threadId` of the trust task exchange the witnessing occurred in
     /// digest: Cryptographic hash of the witnessed edge credential, binding this VWC to the
-    ///         specific edge. Produce it with [DTGCredential::digest] on that credential.
+    ///         specific edge. Produce it with [DTGCredential::digest_multibase] on that
+    ///         credential, or [crate::digest_multibase_json] on the bytes you received.
     ///         REQUIRED by the specification; `Option` here because a VWC that predates the
     ///         requirement still has to deserialize. A VWC without one identifies the
     ///         observed party and the exchange, but not which edge was witnessed.
@@ -492,7 +993,7 @@ impl DTGCredential {
             task_context: Some(task_context),
             credential_subject: CredentialSubject::Witness(CredentialSubjectWitness {
                 id: subject,
-                digest,
+                digest_multibase: digest,
                 witness_context,
             }),
             ..Default::default()
@@ -953,7 +1454,7 @@ mod tests {
   "taskContext": "thread-abc-123",
   "credentialSubject": {
     "id": "did:example:subject",
-    "digest": "zQmbGXRT3v1RmfWkQ7Y3Z5Uj9pKq2NcXhLd8sVtA4eB6nMw",
+    "digestMultibase": "zQmbGXRT3v1RmfWkQ7Y3Z5Uj9pKq2NcXhLd8sVtA4eB6nMw",
     "witnessContext": {
       "event": "EthDenver 2024",
       "sessionId": "session-8822-nonce",

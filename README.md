@@ -2,7 +2,7 @@
 
 **_NOTE:_** This is an early implementation of the [DTG Core Credentials
 specification](https://github.com/trustoverip/dtgwg-cred-spec) (v1.0, Working
-Draft 01), which supersedes the earlier v0.3 proposal draft.
+Draft 02), which supersedes the earlier v0.3 proposal draft.
 
 See the [First Person Project Whitepaper](https://www.firstperson.network/white-paper)
 for more information.
@@ -21,9 +21,15 @@ cargo run --example data_room         # a whole data room, end to end
 `data_room` runs the room story in one process with real DIDs, real signed credentials,
 real AEAD and real chain verification: a room issues its owner a VAC, invites a member by
 VIC, completes the VMC pair on their acknowledgement, seals a record, watches that member
-equip an **agent with strictly less authority than they hold themselves**, rotates the
-epoch on removal, and finally prints exactly what the host can see — which is ciphertext,
-an epoch number, and nothing else.
+equip an **agent with strictly less authority than they hold themselves**, then appoints a
+service to act **in that member's name** by VDC — the same member, two credentials, and a
+verifier that can always tell which it was shown — rotates the epoch on removal, and
+finally prints exactly what the host can see, which is ciphertext, an epoch number, and
+nothing else.
+
+The credential types each have their own tests; `tests/authority_chain.rs` and
+`tests/delegation_chain.rs` are mostly *attacks*, since what makes a VAC or a VDC
+safe is a verifier refusing a chain that widens.
 
 ## Credential Type Hierarchy
 
@@ -34,15 +40,28 @@ VerifiableCredential
 └── DTGCredential
     ├── MembershipCredential (VMC)
     ├── RelationshipCredential (VRC)
+    ├── DelegationCredential (VDC)
     ├── InvitationCredential (VIC)
     ├── PersonaCredential (VPC)
     ├── EndorsementCredential (VEC)
-    └── WitnessCredential (VWC)
+    ├── WitnessCredential (VWC)
+    └── AuthorityCredential (VAC)
 ```
 
+Two of those confer rather than assert, and a verifier has to be able to tell
+which it was shown:
+
+| | Question it answers | The act is attributed to |
+| --- | --- | --- |
+| **VAC** (authority) | may this party do this thing, *as itself*? | the party itself |
+| **VDC** (delegation) | may this party act *in another's name*? | the entity it stands in for |
+
+Neither implies the other, and a VDC never supplies authority the delegator did
+not itself hold. See [Authority](#authority-vac) and [Delegation](#delegation-vdc).
+
 **_NOTE:_** The relationship card (R-Card) is **not** a `DTGCredential` subtype.
-Working Draft 01 reclassifies it as a verifiable data structure (VDS), to be
-defined by the planned *DTG Verifiable Data Structures* specification. The
+It was reclassified as a verifiable data structure (VDS) in Working Draft 01, to
+be defined by the planned *DTG Verifiable Data Structures* specification. The
 `RCard` type, `CredentialSubjectRCard` and `new_rcard()` are deprecated in this
 library and will be removed in a future release.
 
@@ -69,31 +88,37 @@ assert_eq!(vwc.task_context(), Some("thread-abc-123"));
 
 ## Digests
 
-An edge credential can be referenced by another credential through a `digest` of
-it: a member-issued VMC digests the membership grant it acknowledges, and a VWC
-digests the edge credential it attests. Both use the same computation.
+A credential can be referenced by another through a `digestMultibase` of it: a
+member-issued VMC digests the membership grant it acknowledges, a VWC digests the
+edge credential it attests, an attenuated VAC digests the VAC it narrows, and a
+VDC digests the delegation it derives from or the grant it accepts. All five use
+the same computation.
 
 ```Rust
 // A credential you received: digest the JSON as it arrived.
-let digest = dtg_credentials::digest_json(&grant_json)?;
+let digest = dtg_credentials::digest_multibase_json(&grant_json)?;
 
-// A credential this library just built: `digest()` is equivalent.
-let digest = grant.digest()?;
+// A credential this library just built: `digest_multibase()` is equivalent.
+let digest = grant.digest_multibase()?;
 ```
 
-> [!IMPORTANT]
-> Digest what you **received**, not what you parsed. A credential may carry
-> members this library does not model — `credentialStatus` is the common one,
-> and every VMC issued against a status list has it — and a
-> parse-then-re-serialise round trip drops them silently. `digest()` is safe
-> only for a credential built in-process; anything that arrived from elsewhere
-> goes through `digest_json()`.
+That is the SHA-256 of the credential canonicalized with JCS (RFC 8785) and
+**excluding its top-level `proof`**, wrapped in a `sha2-256` multihash and
+encoded base58btc with a multibase `z` prefix — the encoding [VC Data Integrity
+§2.6](https://www.w3.org/TR/vc-data-integrity/#resource-integrity) defines for
+`digestMultibase`. Leaving `proof` out binds the digest to what the credential
+says rather than to one signature over it, so a reference survives its referent
+being re-signed, and the digest can be computed before signing.
 
-That is `sha256:` followed by the lowercase hex SHA-256 of the credential
-canonicalized with JCS (RFC 8785), **excluding its top-level `proof`**. Leaving
-`proof` out binds the digest to what the credential says rather than to one
-signature over it, so a reference survives its referent being re-signed, and the
-digest can be computed before signing.
+> [!IMPORTANT]
+> Digest what you **received**, not what you parsed, wherever you still hold the
+> bytes. `DTGCommon` now models `credentialStatus` and preserves unmodelled
+> top-level members through a round trip, so for most credentials the two agree —
+> but a timestamp is normalized on the way out, and
+> `2026-01-06T10:00:00.000+00:00` hashes differently from the
+> `2026-01-06T10:00:00Z` this library re-emits. `digest_multibase()` is safe for a
+> credential built in-process; anything that arrived from elsewhere goes through
+> `digest_multibase_json()`.
 
 `verify_digest()` checks that a credential's digest matches the one it names:
 
@@ -103,23 +128,35 @@ if vwc.verify_digest(&vrc)? {
 }
 ```
 
+It compares **decoded bytes**, not strings — the specification requires it,
+because one digest has more than one spelling. `digests_match()` and
+`decode_digest_multibase()` are exposed for callers doing the comparison
+themselves.
+
 For a membership pair, prefer `acknowledges()` — it checks the digest *and* that
 the two halves are of the right types and name the same parties in mirrored
-roles. See [Membership edges](#membership-edges).
+roles. See [Membership edges](#membership-edges). `accepts()` is its counterpart
+for a delegation edge.
 
 > [!NOTE]
-> `digest_multibase()` is deprecated. It emits a base58btc multibase multihash
-> over the credential *including* its proof, which is not what the specification
-> requires and does not interoperate. Use `digest()`.
+> `digest()` and `digest_json()` are deprecated. They emit the Working Draft 01
+> `sha256:<lowercase hex>` form, which Working Draft 02 replaced. They are kept
+> so a caller migrating can recompute an old digest to compare against one they
+> stored; new code uses `digest_multibase()` / `digest_multibase_json()`.
+>
+> On the wire, `digestMultibase` is what this library emits, and the old property
+> name `digest` is still accepted when parsing. A credential carrying an old
+> *value* parses and then fails to compare, with `InvalidDigest` rather than a
+> silent mismatch.
 
 ## Membership edges
 
 Membership is a **pair** of VMCs, not a single directed credential:
 
-| | `issuer` | `credentialSubject.id` | `digest` |
+| | `issuer` | `credentialSubject.id` | `digestMultibase` |
 | --- | --- | --- | --- |
-| **Community-issued** (the grant) | community C-DID | member M-DID | MUST be absent |
-| **Member-issued** (the acknowledgement) | member M-DID | community C-DID | MUST be present |
+| **Community-issued** (the grant) | community | member | MUST be absent |
+| **Member-issued** (the acknowledgement) | member | community | MUST be present |
 
 The member-issued half is the member's *consent artifact*. A community can
 always issue a credential naming somebody as a member; what it cannot do is
@@ -155,6 +192,120 @@ Because the digest covers the grant's claims, a **re-issued** grant carries a
 different digest and the earlier acknowledgement no longer matches it. Renewal
 therefore forces re-acknowledgement rather than letting a stale consent carry
 over to a membership the member never agreed to.
+
+## Authority (VAC)
+
+A VAC states what a party **may do** within a scope some node governs. Its holder
+can narrow it without involving the governing party — which is what lets a member
+equip an agent with four hours of read-only access instead of lending it their own
+standing authority.
+
+```Rust
+// The governing party grants Bob read+write+curate for a month.
+let root = DTGCredential::new_vac(
+  room_did, bob_did, room_did.clone(),
+  vec!["read".into(), "write".into(), "curate".into()],
+  now, now + Duration::days(30),   // validUntil is REQUIRED on a VAC
+)?;
+
+// Bob equips his agent with strictly less, bound to that agent.
+let agent = root.attenuate(
+  agent_did, vec!["read".into()], now, now + Duration::hours(4), Some(agent_did),
+)?;
+```
+
+`attenuate()` refuses anything that would widen, but **the verifier's check is the
+authoritative one** — nothing stops another implementation building the JSON by
+hand. `authority::verify_chain` is where the security of this credential lives:
+
+```Rust
+let permitted = verify_chain(
+  &[agent, root],   // leaf first; the holder presents every link
+  room_did, room_did, "read", agent_did, Utc::now(),
+)?;
+```
+
+Anyone can mint a well-formed VAC naming any scope and any actions, and it will
+verify perfectly as a *credential*. What makes it worthless is that its chain does
+not reach the party governing the scope. A verifier that checks only the credential
+it was handed has verified nothing.
+
+`parent` is a **digest**, not an identifier. So there is nothing a verifier could be
+induced to fetch, verification never depends on network availability, and a link
+binds to the exact claims its issuer narrowed from — re-issuing a parent with
+different claims orphans its children, while re-proofing it leaves them alone.
+For a VAC that arrived from a counterparty, use `attenuate_from_json()` and give it
+the bytes you received.
+
+> [!NOTE]
+> Three upstream changes to the VAC are **not** implemented yet: revocation via
+> `credentialStatus`, cascading to everything attenuated below
+> ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)); a
+> `maxAttenuation` ceiling ([PR #40](https://github.com/trustoverip/dtgwg-cred-spec/pull/40));
+> and a key-control demonstration at invocation, which removes `audience` as
+> redundant ([PR #41](https://github.com/trustoverip/dtgwg-cred-spec/pull/41)).
+> `audience` is kept until that lands rather than being removed twice. A verified
+> chain is not by itself evidence that the party presenting it is the leaf's subject.
+
+## Delegation (VDC)
+
+A VDC establishes that one party may act **in another's name**. It is not authority,
+and the distinction decides which credential to reach for: ask whose name the act is
+performed in. The actor's own — that is a VAC. Another entity's — that is a VDC.
+
+Like membership, a delegation is a **pair**:
+
+| | `issuer` | `credentialSubject.id` | carries |
+| --- | --- | --- | --- |
+| **Grant** | delegator | delegate | `scope`, optionally `maxDepth` |
+| **Acceptance** | delegate | delegator | `accepts` only |
+
+```Rust
+// Alice appoints her agent, permitting one further hop.
+let grant = DTGCredential::new_vdc(
+  alice_did, agent_did, now, now + Duration::days(90),
+  vec!["schedule:read".into(), "schedule:propose".into()],
+  Some(1),                          // maxDepth; None or 0 prohibits re-delegation
+)?;
+
+// The agent accepts. `grant_json` is the wire form, not a parse of it.
+let acceptance = DTGCredential::new_delegate_vdc(&grant_json, now, valid_until)?;
+assert!(acceptance.accepts(&grant)?);
+```
+
+The acceptance is **required**. A grant alone establishes what the delegator
+appointed, not what the delegate agreed to — and a delegator cannot produce the
+countersignature. It is also why a party holding only the delegate's key cannot
+manufacture new appointments.
+
+Re-delegation is **opt-in**, the opposite default from a VAC's attenuation. A
+delegate speaks in the principal's name, so the principal keeps the register of who
+may do that; a delegate needing a further delegate ordinarily asks for a fresh root
+delegation rather than minting one.
+
+```Rust
+let sub = grant.redelegate(subagent_did, vec!["schedule:read".into()], now, until)?;
+
+let appointed = delegation::verify_chain(&[sub, grant], alice_did, "schedule:read", Utc::now())?;
+assert_eq!(appointed.principal, alice_did);   // the acts are attributed to Alice
+```
+
+### A VDC moves the permission question; it does not answer it
+
+`verify_chain` tells you the chain appoints this delegate to act in the principal's
+name for this act. That is one of two checks. The other — *may the principal do this
+thing?* — is yours to make, against whatever the act requires of them: membership, a
+governance framework, an IDVC, a VAC. This crate does not answer it, and a VDC never
+influences its outcome.
+
+The reach of a delegated act is the **intersection** of what the principal may do
+and what the chain appoints for. Two consequences worth stating: nothing the
+delegator holds is copied to the delegate, and withdrawing the delegator's own
+permission stops every delegate at once, without revoking a single VDC.
+
+Not implemented here: revocation (`credentialStatus` is modelled but not resolved),
+and invocation binding — a VDC is not a bearer token, and nothing in this crate
+establishes that the party presenting a chain controls the leaf's subject identifier.
 
 ## End to End Example
 

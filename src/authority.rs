@@ -21,20 +21,34 @@
 //! | Each link's issuer must be its parent's subject | grafting someone else's grant onto your own |
 //! | `audience`, where set, must be the presenter | a leaked credential used by whoever holds it |
 //! | Depth is bounded | a denial-of-service against the verifier, which walks every link |
+//! | Every link must carry `validUntil` | authority nobody can withdraw by waiting |
 //!
 //! # Bearer-side resolution
 //!
 //! The holder presents every link. This module **never dereferences**
-//! [`AuthorityGrant::parent`] to fetch a credential it was not given, and
+//! [`crate::AuthorityGrant::parent`] to fetch a credential it was not given, and
 //! [`verify_chain`] takes the chain as a slice for exactly that reason.
 //!
-//! Deliberate, and worth stating because the alternative is attractive until it isn't:
-//! resolving parents over the network would make verification depend on availability, turn
-//! every `id` into a request the verifier can be induced to make against an address the
-//! *holder* chooses, and signal credential use to whoever hosts the identifier. `id` values
-//! in a chain are identifiers, not locators, and need not resolve to anything.
+//! Working Draft 02 made that structural rather than merely required: `parent` is a
+//! **digest**, and a digest names nothing that can be fetched. So verification cannot come
+//! to depend on availability, a verifier cannot be induced to make a request against an
+//! address the *holder* chooses, and nobody hosting an identifier learns when a credential
+//! is used. The digest also binds a link to the exact claims its issuer narrowed from,
+//! which an identifier could not do: a parent re-issued with different claims does not
+//! carry its old children with it.
 //!
-//! Tracks a draft: `trustoverip/dtgwg-cred-spec` PR #29.
+//! # Still ahead of this module
+//!
+//! Three changes to the VAC are in flight upstream and are **not** implemented here:
+//! revocation via `credentialStatus`, cascading to everything attenuated below
+//! ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)); a `maxAttenuation`
+//! ceiling bounding depth per-ancestor rather than only globally
+//! ([PR #40](https://github.com/trustoverip/dtgwg-cred-spec/pull/40)); and a key-control
+//! demonstration at invocation, which removes `audience` as redundant
+//! ([PR #41](https://github.com/trustoverip/dtgwg-cred-spec/pull/41)). Until they land, a
+//! caller wanting revocation must check [`crate::DTGCommon::credential_status`] itself, and
+//! a chain verified here is not evidence that the party presenting it is the leaf's
+//! subject.
 
 use chrono::{DateTime, Utc};
 
@@ -58,6 +72,18 @@ pub enum AuthorityError {
     /// The chain was empty. Nothing to verify.
     #[error("authority chain is empty")]
     EmptyChain,
+
+    /// A link's digest could not be computed, or one it carries could not be read.
+    ///
+    /// Distinct from [AuthorityError::BrokenLink]: a digest that cannot be *read* is not a
+    /// digest that disagrees, and a verifier that conflated the two would report a
+    /// malformed chain as a widening one.
+    #[error("digest error at index {index}: {reason}")]
+    Digest { index: usize, reason: String },
+
+    /// A link carried no `validUntil`, which a VAC MUST have.
+    #[error("VAC at index {index} carries no validUntil, which a VAC MUST have")]
+    NoExpiry { index: usize },
 
     /// The chain is longer than [MAX_CHAIN_DEPTH].
     #[error("authority chain is {found} deep, exceeding the maximum of {MAX_CHAIN_DEPTH}")]
@@ -254,9 +280,14 @@ pub fn verify_chain(
         if c.valid_from() > at {
             return Err(AuthorityError::NotValidNow { index, at });
         }
-        if let Some(until) = c.valid_until()
-            && until < at
-        {
+        // `validUntil` is REQUIRED on a VAC, not merely recommended. Nothing about the
+        // subject's current standing is consulted here, so a VAC that never expires is
+        // authority nobody can withdraw by waiting — and a verifier that accepted one
+        // would be honouring exactly that.
+        let Some(until) = c.valid_until() else {
+            return Err(AuthorityError::NoExpiry { index });
+        };
+        if until < at {
             return Err(AuthorityError::NotValidNow { index, at });
         }
     }
@@ -283,22 +314,39 @@ pub fn verify_chain(
 
         // The link must point at the credential presented as its parent. Without this a
         // holder could interleave links from unrelated chains.
-        match (&grant.parent, parent.id()) {
-            (Some(named), Some(presented)) if named == presented => {}
-            (Some(named), presented) => {
-                return Err(AuthorityError::BrokenLink {
-                    index,
-                    named: named.clone(),
-                    presented: presented.unwrap_or("<no id>").to_string(),
-                });
+        //
+        // `parent` is a digest, not an identifier, so this is a hash comparison over the
+        // parent's claims — and the specification requires comparing decoded digest bytes
+        // rather than encoded strings, since one digest has more than one spelling.
+        let presented_digest = parent
+            .digest_multibase()
+            .map_err(|e| AuthorityError::Digest {
+                index: index + 1,
+                reason: e.to_string(),
+            })?;
+        match &grant.parent {
+            Some(named) => {
+                let matches = crate::digests_match(named, &presented_digest).map_err(|e| {
+                    AuthorityError::Digest {
+                        index,
+                        reason: e.to_string(),
+                    }
+                })?;
+                if !matches {
+                    return Err(AuthorityError::BrokenLink {
+                        index,
+                        named: named.clone(),
+                        presented: presented_digest,
+                    });
+                }
             }
-            (None, presented) => {
+            None => {
                 // A link with no `parent` claims to be a root, but something was presented
                 // above it.
                 return Err(AuthorityError::BrokenLink {
                     index,
                     named: "<none — link claims to be a root>".to_string(),
-                    presented: presented.unwrap_or("<no id>").to_string(),
+                    presented: presented_digest,
                 });
             }
         }
@@ -328,6 +376,7 @@ pub fn verify_chain(
                 });
             }
         }
+        // Both are present: the loop above rejected any link without one.
         if let (Some(until), Some(parent_until)) = (
             link.credential().valid_until(),
             parent.credential().valid_until(),

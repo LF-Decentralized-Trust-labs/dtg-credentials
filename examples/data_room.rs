@@ -48,8 +48,8 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 use chrono::{Duration, Utc};
-use dtg_credentials::{DTGCredential, authority::verify_chain};
-use rand::RngCore;
+use dtg_credentials::{DTGCredential, authority::verify_chain, delegation};
+use rand::Rng;
 
 // ---------------------------------------------------------------------------------------
 // The host
@@ -132,12 +132,12 @@ fn aad(room: &str, key: &str, version: u32, epoch: u32) -> Vec<u8> {
 }
 
 fn seal(room_key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, [u8; 12])> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(room_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*room_key));
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let sealed = cipher
         .encrypt(
-            Nonce::from_slice(&nonce_bytes),
+            &Nonce::from(nonce_bytes),
             Payload {
                 msg: plaintext,
                 aad,
@@ -148,15 +148,15 @@ fn seal(room_key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, [
 }
 
 fn open(room_key: &[u8; 32], sealed: &[u8], nonce: &[u8; 12], aad: &[u8]) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(room_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*room_key));
     cipher
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: sealed, aad })
+        .decrypt(&Nonce::from(*nonce), Payload { msg: sealed, aad })
         .map_err(|e| anyhow::anyhow!("open failed: {e}"))
 }
 
 fn new_room_key() -> [u8; 32] {
     let mut k = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut k);
+    rand::rng().fill_bytes(&mut k);
     k
 }
 
@@ -183,6 +183,7 @@ async fn main() -> Result<()> {
     let (alice_did, _alice_secret) = DID::generate_did_key(KeyType::Ed25519)?;
     let (bob_did, bob_secret) = DID::generate_did_key(KeyType::Ed25519)?;
     let (agent_did, _agent_secret) = DID::generate_did_key(KeyType::Ed25519)?;
+    let (scheduler_did, scheduler_secret) = DID::generate_did_key(KeyType::Ed25519)?;
 
     let mut host = InMemoryHost::default();
     host.set_epoch(&room_did, 1);
@@ -192,7 +193,8 @@ async fn main() -> Result<()> {
     println!("room   {room_did}");
     println!("alice  {alice_did}  (owner)");
     println!("bob    {bob_did}");
-    println!("agent  {agent_did}  (Bob's)");
+    println!("agent  {agent_did}  (Bob's, acts as itself)");
+    println!("sched  {scheduler_did}  (acts in Bob's name)");
 
     // -- 1 ------------------------------------------------------------------------------
     step(1, "Alice creates the room");
@@ -209,7 +211,7 @@ async fn main() -> Result<()> {
             "admin".into(),
         ],
         now,
-        Some(now + Duration::days(365)),
+        now + Duration::days(365),
     )?
     .with_id("urn:uuid:vac-alice");
     alice_vac.sign(&room_secret, None).await?;
@@ -255,7 +257,7 @@ async fn main() -> Result<()> {
         room_did.clone(),
         vec!["read".into(), "write".into()],
         now,
-        Some(now + Duration::days(30)),
+        now + Duration::days(30),
     )?
     .with_id("urn:uuid:vac-bob");
     bob_vac.sign(&room_secret, None).await?;
@@ -293,7 +295,7 @@ async fn main() -> Result<()> {
             agent_did.clone(),
             vec!["read".into()],
             now,
-            Some(now + Duration::hours(4)),
+            now + Duration::hours(4),
             Some(agent_did.clone()),
         )?
         .with_id("urn:uuid:vac-agent");
@@ -326,8 +328,78 @@ async fn main() -> Result<()> {
         Ok(_) => bail!("the agent must not be able to write"),
     }
 
+    // -- 5b -----------------------------------------------------------------------------
+    step(6, "Bob appoints a scheduler to act in his name");
+    // The contrast that decides which credential to reach for: *whose name is the act in?*
+    //
+    // The agent above acts as ITSELF. The room records the agent as the actor, the agent
+    // answers for what it does, and the chain records only who equipped it. That is
+    // authority, and it is a VAC.
+    //
+    // A scheduling service is the other case. When it proposes a meeting it is speaking as
+    // Bob — the act is attributed to him, and he is answerable for it. That is
+    // representation, and no amount of authority expresses it.
+    let mut appointment = DTGCredential::new_vdc(
+        bob_did.clone(),
+        scheduler_did.clone(),
+        now,
+        now + Duration::days(30),
+        vec!["schedule:read".into(), "schedule:propose".into()],
+        Some(0), // no re-delegation: Bob keeps the register of who speaks for him
+    )?
+    .with_id("urn:uuid:vdc-scheduler");
+    appointment.sign(&bob_secret, None).await?;
+    println!("Bob issued a VDC: schedule:read + schedule:propose · 30 days · no re-delegation");
+
+    // A grant alone appoints nobody. Bob can name anyone as his delegate; what he cannot
+    // do is produce their signature. So the scheduler countersigns, taking on the
+    // accountability that comes with acting in someone else's name.
+    let grant_json = serde_json::to_value(appointment.credential())?;
+    let mut acceptance =
+        DTGCredential::new_delegate_vdc(&grant_json, now, now + Duration::days(30))?
+            .with_id("urn:uuid:vdc-scheduler-ack");
+    acceptance.sign(&scheduler_secret, None).await?;
+
+    if !acceptance.accepts(&appointment)? {
+        bail!("the acceptance must bind to the grant");
+    }
+    println!("scheduler countersigned — the delegation edge is complete");
+
+    let appointed = delegation::verify_chain(
+        std::slice::from_ref(&appointment),
+        &bob_did,
+        "schedule:propose",
+        Utc::now(),
+    )
+    .context("the scheduler's appointment must verify")?;
+    println!(
+        "  chain verified → acts are attributed to {}, not to the scheduler",
+        &appointed.principal[..18]
+    );
+
+    // The rule that keeps the two credentials from reinterpreting each other. The VDC says
+    // the scheduler may speak in Bob's name; it says nothing about what Bob may do in the
+    // room, and confers none of Bob's authority on the scheduler.
+    match verify_chain(
+        std::slice::from_ref(&appointment),
+        &room_did,
+        &room_did,
+        "read",
+        &scheduler_did,
+        Utc::now(),
+    ) {
+        Err(e) => println!("  VDC correctly refused as authority: {e}"),
+        Ok(_) => bail!("a VDC must never be read as conferring authority"),
+    }
+
+    // What the scheduler may actually do in the room is the intersection of the two: what
+    // the appointment covers, and what BOB's own authority covers — asked live, of Bob,
+    // at the time of the act. Revoking Bob's VAC stops the scheduler without touching the
+    // VDC at all.
+    println!("  reach = what the VDC appoints for ∩ what Bob may do — the second asked live");
+
     // -- 6 ------------------------------------------------------------------------------
-    step(6, "Alice removes Bob");
+    step(7, "Alice removes Bob");
     // Removal is a rekey. The old key opens what it always did; the new one is sealed only
     // to who remains, so nothing written after is reachable.
     verify_chain(
@@ -367,7 +439,7 @@ async fn main() -> Result<()> {
     );
 
     // -- 7 ------------------------------------------------------------------------------
-    step(7, "What the host can see");
+    step(8, "What the host can see");
     println!("The host stores this and nothing else. No plaintext, no member list, no");
     println!("credentials — membership was never something it was told.\n");
     println!("  room         {room_did}");
