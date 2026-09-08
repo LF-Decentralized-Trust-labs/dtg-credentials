@@ -23,19 +23,19 @@ multibase = "0.9"
 serde = "1.0"
 serde_json = "1.0"
 serde_json_canonicalizer = "0.3"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2.0"
 tracing = "0.1"
 
 [dev-dependencies]
-affinidi-tdk = "0.10"
+affinidi-tdk = "0.12"
 anyhow = "1.0"
 tokio = "1"
 # The `data_room` example seals records for real rather than pretending to. Dev-only:
 # nothing in the library itself encrypts, and adding a cipher to its dependency graph for
 # the sake of an example would be the wrong trade.
-chacha20poly1305 = "0.10"
-rand = "0.8"
+chacha20poly1305 = "0.11"
+rand = "0.10"
 
 # Both examples sign, and signing lives behind `affinidi-signing`. Without this
 # a `--no-default-features` build fails on the examples while the library it is

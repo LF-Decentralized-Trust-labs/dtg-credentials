@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Dependencies updated to their current releases. Three are semver-major: `sha2` 0.10 → 0.11,
+  and — dev-only — `chacha20poly1305` 0.10 → 0.11 and `rand` 0.8 → 0.10. The `sha2` bump is
+  the one worth noting: `affinidi-data-integrity` already pulls `sha2` 0.11 through
+  `affinidi-crypto`, so the library was linking two copies of it and hashing with the older
+  one. The library graph now carries a single `sha2`. Digest output is unchanged — the tests
+  that pin known digests pass untouched.
+- `affinidi-tdk` 0.10 → 0.12 (dev-dependency; the examples' DIDs and signing).
+- The `data_room` example moves to the `rand` 0.10 API (`rand::rng()`, `rand::Rng`) and off
+  the now-deprecated `Key::from_slice`/`Nonce::from_slice` in `chacha20poly1305`.
+
 ## [0.6.0] - 2026-09-03
 
 Adds the two credentials that confer rather than assert: the **VAC** (verifiable authority

@@ -49,7 +49,7 @@ use chacha20poly1305::{
 };
 use chrono::{Duration, Utc};
 use dtg_credentials::{DTGCredential, authority::verify_chain};
-use rand::RngCore;
+use rand::Rng;
 
 // ---------------------------------------------------------------------------------------
 // The host
@@ -132,12 +132,12 @@ fn aad(room: &str, key: &str, version: u32, epoch: u32) -> Vec<u8> {
 }
 
 fn seal(room_key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, [u8; 12])> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(room_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*room_key));
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let sealed = cipher
         .encrypt(
-            Nonce::from_slice(&nonce_bytes),
+            &Nonce::from(nonce_bytes),
             Payload {
                 msg: plaintext,
                 aad,
@@ -148,15 +148,15 @@ fn seal(room_key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, [
 }
 
 fn open(room_key: &[u8; 32], sealed: &[u8], nonce: &[u8; 12], aad: &[u8]) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(room_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*room_key));
     cipher
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: sealed, aad })
+        .decrypt(&Nonce::from(*nonce), Payload { msg: sealed, aad })
         .map_err(|e| anyhow::anyhow!("open failed: {e}"))
 }
 
 fn new_room_key() -> [u8; 32] {
     let mut k = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut k);
+    rand::rng().fill_bytes(&mut k);
     k
 }
 
