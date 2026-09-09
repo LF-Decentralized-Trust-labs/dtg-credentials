@@ -237,15 +237,23 @@ different claims orphans its children, while re-proofing it leaves them alone.
 For a VAC that arrived from a counterparty, use `attenuate_from_json()` and give it
 the bytes you received.
 
+**A VAC is not a bearer credential.** `verify_chain()` takes the presenter and requires
+the leaf to grant to it, so a captured presentation is worthless to whoever captured it.
+Pass an identifier whose key control you have already established for *this* request — the
+DID a transport authenticated, or one a signature over the request proved — never one read
+out of the request body.
+
+That rule is why there is no `audience`. Equipping an agent means naming the agent in
+`subject`; a second field naming who may present could then only repeat the subject or
+contradict it. Where a presentation may be *sent* is a different question, and it belongs
+to the trust task carrying it rather than to the credential.
+
 > [!NOTE]
-> Three upstream changes to the VAC are **not** implemented yet: revocation via
+> Two upstream changes to the VAC are **not** implemented yet: revocation via
 > `credentialStatus`, cascading to everything attenuated below
-> ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)); a
-> `maxAttenuation` ceiling ([PR #40](https://github.com/trustoverip/dtgwg-cred-spec/pull/40));
-> and a key-control demonstration at invocation, which removes `audience` as
-> redundant ([PR #41](https://github.com/trustoverip/dtgwg-cred-spec/pull/41)).
-> `audience` is kept until that lands rather than being removed twice. A verified
-> chain is not by itself evidence that the party presenting it is the leaf's subject.
+> ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)); and a
+> `maxAttenuation` ceiling
+> ([PR #40](https://github.com/trustoverip/dtgwg-cred-spec/pull/40)).
 
 ## Delegation (VDC)
 

@@ -34,16 +34,11 @@ fn root_grant() -> DTGCredential {
     .with_id("urn:uuid:root-0001")
 }
 
-/// Bob equips his agent with read-only for four hours, bound to the agent.
+/// Bob equips his agent with read-only for four hours. Naming the agent as `subject` is
+/// the whole of the binding: only the agent can present what only the agent is granted.
 fn agent_grant(parent: &DTGCredential) -> DTGCredential {
     parent
-        .attenuate(
-            AGENT.into(),
-            vec!["read".into()],
-            t(0),
-            t(4),
-            Some(AGENT.into()),
-        )
+        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(4))
         .expect("attenuation")
         .with_id("urn:uuid:agent-0001")
 }
@@ -121,7 +116,7 @@ fn attenuation_cannot_add_an_action_the_parent_lacks() {
 
     // Refused at issue time...
     let err = root
-        .attenuate(AGENT.into(), vec!["write".into()], t(0), t(4), None)
+        .attenuate(AGENT.into(), vec!["write".into()], t(0), t(4))
         .unwrap_err();
     assert!(
         format!("{err}").contains("not conferred by the parent"),
@@ -159,7 +154,7 @@ fn attenuation_cannot_add_an_action_the_parent_lacks() {
 fn attenuation_cannot_outlive_its_parent() {
     let root = root_grant();
     let err = root
-        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(24 * 365), None)
+        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(24 * 365))
         .unwrap_err();
     assert!(format!("{err}").contains("beyond the parent's"), "{err}");
 }
@@ -193,15 +188,47 @@ fn a_link_issued_by_someone_other_than_the_parents_subject_is_refused() {
     );
 }
 
-/// Audience binding is what makes a leaked agent credential useless to whoever picks it up.
+/// A VAC is not a bearer credential: the leaf must grant to whoever presents it. This is
+/// what makes a captured presentation useless to whoever captured it.
 #[test]
-fn an_audience_bound_credential_refuses_another_presenter() {
+fn a_chain_presented_by_someone_other_than_its_subject_is_refused() {
     let root = root_grant();
     let agent = agent_grant(&root);
 
     let err = verify_chain(&[agent, root], ROOM, ROOM, "read", MALLORY, t(1)).unwrap_err();
     assert!(
-        matches!(err, AuthorityError::WrongAudience { ref presenter, .. } if presenter == MALLORY),
+        matches!(
+            err,
+            AuthorityError::NotThePresenter { ref subject, ref presenter }
+                if subject == AGENT && presenter == MALLORY
+        ),
+        "got {err:?}"
+    );
+}
+
+/// The same rule applies to a root presented directly — the case with no attenuation at
+/// all, which is where a bearer reading would be easiest to reach for.
+#[test]
+fn a_root_presented_by_someone_other_than_its_subject_is_refused() {
+    let err = verify_chain(&[root_grant()], ROOM, ROOM, "write", MALLORY, t(1)).unwrap_err();
+    assert!(
+        matches!(err, AuthorityError::NotThePresenter { ref subject, .. } if subject == BOB),
+        "got {err:?}"
+    );
+}
+
+/// The principal may not present what they gave away. Bob holds `read`/`write`/`curate` at
+/// the room, but the *leaf* of this chain grants to his agent — so the chain says the agent
+/// is acting, and Bob presenting it is as wrong as Mallory doing so. Bob presents his own
+/// root instead; that is a different chain.
+#[test]
+fn the_attenuating_holder_cannot_present_their_agents_chain() {
+    let root = root_grant();
+    let agent = agent_grant(&root);
+
+    let err = verify_chain(&[agent, root], ROOM, ROOM, "read", BOB, t(1)).unwrap_err();
+    assert!(
+        matches!(err, AuthorityError::NotThePresenter { ref presenter, .. } if presenter == BOB),
         "got {err:?}"
     );
 }
@@ -273,7 +300,7 @@ fn a_vac_round_trips_through_json_with_its_grant_intact() {
     assert_eq!(grant.actions.len(), 3);
     assert!(grant.parent.is_none(), "a root carries no parent");
 
-    // And the attenuated form keeps its chain link and its audience.
+    // And the attenuated form keeps its chain link.
     let agent = agent_grant(&root);
     let json = serde_json::to_string(&agent).unwrap();
     let back: DTGCredential = serde_json::from_str(&json).unwrap();
@@ -283,7 +310,6 @@ fn a_vac_round_trips_through_json_with_its_grant_intact() {
         Some(root.digest_multibase().unwrap().as_str()),
         "`parent` is the digest of the credential attenuated from, not its id"
     );
-    assert_eq!(grant.audience.as_deref(), Some(AGENT));
     assert_eq!(grant.actions, vec!["read".to_string()]);
 }
 
@@ -351,7 +377,7 @@ fn a_parent_without_an_id_can_still_be_attenuated() {
     assert!(root.id().is_none());
 
     let agent = root
-        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(4), None)
+        .attenuate(AGENT.into(), vec!["read".into()], t(0), t(4))
         .expect("attenuation does not need the parent to have an id");
 
     let v = verify_chain(&[agent, root], ROOM, ROOM, "read", AGENT, t(1)).expect("verifies");
@@ -440,7 +466,6 @@ fn attenuating_from_json_digests_the_wire_form() {
         vec!["read".into()],
         t(0),
         t(4),
-        Some(AGENT.into()),
     )
     .expect("attenuation");
 
@@ -467,7 +492,6 @@ fn attenuating_from_json_still_refuses_to_widen() {
         vec!["delete".into()],
         t(0),
         t(4),
-        None,
     )
     .unwrap_err();
 
