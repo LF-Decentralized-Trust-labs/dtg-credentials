@@ -15,8 +15,9 @@
 //! 2. Alice invites Bob — a **VIC**, issued by the room.
 //! 3. Bob presents it and receives a **VMC pair** (membership) and a **VAC** (what he may do).
 //! 4. Bob writes a record. Sealed under the epoch key, AAD-bound to its location.
-//! 5. Bob attenuates a **read-only, four-hour, audience-bound VAC to his agent**, which
-//!    recalls the record. The agent never holds Bob's own authority.
+//! 5. Bob attenuates a **read-only, four-hour VAC to his agent**, which recalls the
+//!    record. The agent never holds Bob's own authority, and — because a VAC is not a
+//!    bearer credential — nobody but the agent can present what the agent was granted.
 //! 6. Alice removes Bob. The epoch rotates and the new key is sealed only to who remains.
 //!    Bob's agent can still read what it already could — and nothing written after.
 //! 7. The host view: every byte the operator holds.
@@ -296,11 +297,10 @@ async fn main() -> Result<()> {
             vec!["read".into()],
             now,
             now + Duration::hours(4),
-            Some(agent_did.clone()),
         )?
         .with_id("urn:uuid:vac-agent");
     agent_vac.sign(&bob_secret, None).await?;
-    println!("Bob issued his agent a VAC: read only · 4 hours · audience-bound to the agent");
+    println!("Bob issued his agent a VAC: read only · 4 hours · presentable only by the agent");
 
     // The agent presents the whole chain; the verifier walks it to the room.
     let chain = vec![agent_vac.clone(), bob_vac.clone()];

@@ -19,7 +19,7 @@
 //! | No link may widen `scope` | authority earned in one room used in another |
 //! | No link may outlive its parent | an expiry escaped by re-delegation |
 //! | Each link's issuer must be its parent's subject | grafting someone else's grant onto your own |
-//! | `audience`, where set, must be the presenter | a leaked credential used by whoever holds it |
+//! | The leaf's subject must be the presenter | a captured presentation replayed by whoever caught it |
 //! | Depth is bounded | a denial-of-service against the verifier, which walks every link |
 //! | Every link must carry `validUntil` | authority nobody can withdraw by waiting |
 //!
@@ -37,18 +37,41 @@
 //! which an identifier could not do: a parent re-issued with different claims does not
 //! carry its old children with it.
 //!
+//! # A VAC is not a bearer credential
+//!
+//! [`verify_chain`] takes a `presenter` and requires the leaf to grant to it. That is the
+//! rule [PR #41](https://github.com/trustoverip/dtgwg-cred-spec/pull/41) states normatively
+//! — *a verifier MUST NOT accept a party as holding the authority a VAC confers unless that
+//! party demonstrates control of the verification method associated with the presented
+//! VAC's `credentialSubject.id`* — and it is why this module no longer has an `audience`.
+//!
+//! An earlier draft of the VAC carried an OPTIONAL `audience` naming the DID that had to
+//! present the credential, and this module compared it against `presenter`. Once the
+//! presenter must be the subject, that field can only name the same party (adding nothing)
+//! or a different one (satisfiable by nobody), so it was removed rather than kept as a
+//! weaker second check. The destination question it was sometimes read as answering —
+//! *where* may this be presented — is not the credential's to answer; it belongs to the
+//! trust task carrying the presentation, which binds its own recipient.
+//!
+//! **What `presenter` must be.** The identifier of a party whose key control the caller has
+//! already established for *this request* — the DID a transport authenticated, or one a
+//! signature over the request proved. Passing an identifier the caller merely read out of
+//! the request body reduces this check to a string comparison an attacker chooses both
+//! sides of.
+//!
+//! **Only the leaf's subject demonstrates anything.** The parties named in the links above
+//! it are not present and are asked for nothing. Requiring otherwise would defeat
+//! attenuation, whose whole purpose is that the party who attenuated is not in the loop
+//! when its agent acts.
+//!
 //! # Still ahead of this module
 //!
-//! Three changes to the VAC are in flight upstream and are **not** implemented here:
+//! Two changes to the VAC are in flight upstream and are **not** implemented here:
 //! revocation via `credentialStatus`, cascading to everything attenuated below
-//! ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)); a `maxAttenuation`
-//! ceiling bounding depth per-ancestor rather than only globally
-//! ([PR #40](https://github.com/trustoverip/dtgwg-cred-spec/pull/40)); and a key-control
-//! demonstration at invocation, which removes `audience` as redundant
-//! ([PR #41](https://github.com/trustoverip/dtgwg-cred-spec/pull/41)). Until they land, a
-//! caller wanting revocation must check [`crate::DTGCommon::credential_status`] itself, and
-//! a chain verified here is not evidence that the party presenting it is the leaf's
-//! subject.
+//! ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)); and a
+//! `maxAttenuation` ceiling bounding depth per-ancestor rather than only globally
+//! ([PR #40](https://github.com/trustoverip/dtgwg-cred-spec/pull/40)). Until they land, a
+//! caller wanting revocation must check [`crate::DTGCommon::credential_status`] itself.
 
 use chrono::{DateTime, Utc};
 
@@ -187,13 +210,15 @@ pub enum AuthorityError {
         action: String,
     },
 
-    /// A link was presented by a party other than its bound audience.
-    #[error("chain link {index} is bound to audience `{audience}`, presented by `{presenter}`")]
-    WrongAudience {
-        /// Position in the chain, leaf first.
-        index: usize,
-        /// Who the link is bound to.
-        audience: String,
+    /// The leaf grants to somebody other than the party presenting it.
+    ///
+    /// A VAC is evidence that authority was conferred on somebody. It is not evidence that
+    /// whoever handed it over is that somebody, and a verifier that conflated the two would
+    /// authorize every captured presentation.
+    #[error("the chain's leaf grants to `{subject}`, but it was presented by `{presenter}`")]
+    NotThePresenter {
+        /// Who the leaf grants to.
+        subject: String,
         /// Who presented it.
         presenter: String,
     },
@@ -292,15 +317,18 @@ pub fn verify_chain(
         }
     }
 
-    // The leaf must be presentable by whoever is presenting it.
+    // Key control at invocation: the leaf must grant to whoever is presenting it.
+    //
+    // Without this a presentation is a bearer object — it names what may be done, not who
+    // is doing it — so anyone who observes one inherits everything it confers. The check is
+    // only as good as `presenter`: see the module docs on what a caller must have
+    // established before passing one.
     let leaf = &chain[0];
     let leaf_grant = leaf.credential().authority().expect("checked above");
-    if let Some(audience) = &leaf_grant.audience
-        && audience != presenter
-    {
-        return Err(AuthorityError::WrongAudience {
-            index: 0,
-            audience: audience.clone(),
+    let leaf_subject = leaf.credential().subject();
+    if leaf_subject != presenter {
+        return Err(AuthorityError::NotThePresenter {
+            subject: leaf_subject.to_string(),
             presenter: presenter.to_string(),
         });
     }

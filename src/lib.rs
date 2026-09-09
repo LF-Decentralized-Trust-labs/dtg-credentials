@@ -636,9 +636,11 @@ pub enum DTGCredentialType {
     /// specified actions within a named scope governed by the issuer.
     ///
     /// Merged into DTG Core Credentials at Working Draft 02
-    /// (`trustoverip/dtgwg-cred-spec` PR #29). Three further changes to the VAC are in
-    /// flight and not implemented here — revocation (PR #39), a `maxAttenuation` ceiling
-    /// (PR #40), and key-control at invocation, which removes `audience` (PR #41).
+    /// (`trustoverip/dtgwg-cred-spec` PR #29). Key control at invocation — a VAC is not a
+    /// bearer credential — is implemented in [crate::authority::verify_chain], ahead of
+    /// PR #41 which states it normatively and removes the `audience` property it made
+    /// redundant. Two further changes are in flight and not implemented here: revocation
+    /// (PR #39) and a `maxAttenuation` ceiling (PR #40).
     Authority,
 
     /// Verifiable Delegation Credential (VDC) — establishes that one entity may act in
@@ -1288,21 +1290,6 @@ pub struct AuthorityGrant {
     /// because the digest excludes `proof`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-
-    /// A DID that MUST be the presenter for this VAC to be accepted.
-    ///
-    /// Absent means any holder may present it. Setting it is what makes a leaked agent
-    /// credential useless to anyone but that agent.
-    ///
-    /// # Slated for removal upstream
-    ///
-    /// `trustoverip/dtgwg-cred-spec` PR #41 removes this property, having made it
-    /// redundant: a VAC is not a bearer credential, and requiring the leaf's subject to
-    /// demonstrate key control at invocation already establishes that the presenter is the
-    /// subject. It is kept here until that lands, because removing a shipped field twice
-    /// is worse than removing it once.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub audience: Option<String>,
 }
 
 /// The `delegation` object a [CredentialSubject::Delegation] carries.

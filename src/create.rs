@@ -282,7 +282,6 @@ impl DTGCredential {
                     scope,
                     actions,
                     parent: None,
-                    audience: None,
                 },
             }),
             ..Default::default()
@@ -314,8 +313,13 @@ impl DTGCredential {
     /// - `self` must be a VAC.
     /// - `actions` must be a subset of what `self` confers.
     /// - `valid_until` must not exceed `self`'s.
-    /// - `audience` binds the derived credential to one presenter; strongly recommended
-    ///   when equipping an agent, since it makes a leaked credential useless to anyone else.
+    ///
+    /// # Binding the derivative to the agent is `subject`, not a separate field
+    ///
+    /// A VAC is not a bearer credential: [crate::authority::verify_chain] requires the
+    /// party presenting the leaf to be its subject. So equipping an agent means naming the
+    /// agent in `subject`, and there is nothing further to bind. An earlier version of this
+    /// method took an `audience` for that job; it was removed with the property.
     ///
     /// # Digests the model
     ///
@@ -330,7 +334,6 @@ impl DTGCredential {
         actions: Vec<String>,
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
-        audience: Option<String>,
     ) -> Result<Self, DTGCredentialError> {
         let parent_grant = self
             .credential()
@@ -346,7 +349,6 @@ impl DTGCredential {
             actions,
             valid_from,
             valid_until,
-            audience,
         )
     }
 
@@ -369,7 +371,6 @@ impl DTGCredential {
         actions: Vec<String>,
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
-        audience: Option<String>,
     ) -> Result<Self, DTGCredentialError> {
         let object = parent
             .as_object()
@@ -425,7 +426,6 @@ impl DTGCredential {
             actions,
             valid_from,
             valid_until,
-            audience,
         )
     }
 
@@ -440,7 +440,6 @@ impl DTGCredential {
         actions: Vec<String>,
         valid_from: DateTime<Utc>,
         valid_until: DateTime<Utc>,
-        audience: Option<String>,
     ) -> Result<Self, DTGCredentialError> {
         if actions.is_empty() {
             return Err(DTGCredentialError::EmptyAuthorityActions);
@@ -472,7 +471,6 @@ impl DTGCredential {
                     scope: parent_grant.scope.clone(),
                     actions,
                     parent: Some(parent_digest),
-                    audience,
                 },
             }),
             ..Default::default()

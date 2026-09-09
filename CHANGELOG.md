@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-09
+
+**A VAC is not a bearer credential.** This release implements the rule and removes the
+field that was standing in for it.
+
+### Changed — `verify_chain` requires the presenter to be the leaf's subject (breaking)
+
+`authority::verify_chain` already took a `presenter`, and used it for one thing: comparing
+it against the leaf's optional `audience`. A leaf without an `audience` was therefore
+accepted from **anybody**, which made a captured presentation a bearer token — the chain
+names what may be done, not who is doing it.
+
+It now requires the leaf to grant to `presenter`, and refuses otherwise with the new
+`AuthorityError::NotThePresenter`. This is the rule
+[PR #41](https://github.com/trustoverip/dtgwg-cred-spec/pull/41) states normatively: a
+verifier MUST NOT accept a party as holding the authority a VAC confers unless that party
+demonstrates control of the verification method associated with the presented VAC's
+`credentialSubject.id`. Only the leaf's subject demonstrates anything — the links above it
+are not present and are asked for nothing, which is what keeps attenuation working.
+
+Both known consumers were already doing this by hand, having each hit the gap
+independently: `vti-rooms-dtg`'s chain verifier and its nomination check both call
+`verify_chain` and then re-compare the subject themselves, with a comment explaining why
+they must. Two copies of a check is one place for it to be forgotten, so it moves here.
+
+`presenter` must be an identifier whose key control the caller has already established for
+that request. Passing a value read out of the request body reduces the check to a string
+comparison an attacker chooses both sides of.
+
+### Removed — `authority.audience` (breaking, on the wire and in the API)
+
+Gone from `AuthorityGrant`, from `attenuate` and `attenuate_from_json` (which each lose
+their trailing `Option<String>` parameter), and from the verifier along with
+`AuthorityError::WrongAudience`.
+
+Once the presenter must be the subject, an `audience` can only name that same subject —
+adding nothing — or name somebody else, which no presentation can ever satisfy. PR #41
+removes it for exactly that reason, and it is removed here rather than kept as a weaker
+second check.
+
+The property was also being read two incompatible ways, which is what brought this
+forward: this library compared it to the **presenter**, while
+`trusttasks.org/spec/rooms/keys/present/0.1` described it as the party the presentation is
+**for** — "a host's identifier, normally". An implementation that followed the registry
+minted leaves the verifier refused every time. See
+[dtgwg-trust-tasks-tf#414](https://github.com/trustoverip/dtgwg-trust-tasks-tf/issues/414).
+The destination question is real and is answered one layer up, by the trust task
+document's `recipient` member, which its `proof` covers.
+
+**Migrating.** Drop the final argument from `attenuate`/`attenuate_from_json` calls. Where
+you passed the agent's DID, it was already redundant with `subject`. Where you passed a
+verifier's or host's identifier, that binding now belongs on the request document, not the
+credential. Callers already comparing the leaf's subject to the presenter can delete that
+check.
+
+
 ## [0.7.0] - 2026-09-08
 
 Brings the library up to **Working Draft 02** of the DTG Core Credentials
@@ -134,6 +190,7 @@ this crate.
 
 Three changes to the VAC are in flight upstream and are not here. `audience` is kept
 until the last of them lands, rather than removing a shipped field twice.
+*(Superseded by 0.8.0, which implements PR #41 and removes `audience`.)*
 
 - Revocation via `credentialStatus`, cascading to everything attenuated below
   ([PR #39](https://github.com/trustoverip/dtgwg-cred-spec/pull/39)).
