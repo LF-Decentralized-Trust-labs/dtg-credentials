@@ -1084,6 +1084,76 @@ impl DTGCredential {
     pub fn set_id(&mut self, id: impl Into<String>) {
         self.credential.id = Some(id.into());
     }
+
+    /// Attaches the status mechanism through which a verifier determines whether this
+    /// credential has been revoked.
+    ///
+    /// The entry is opaque to this library: the mechanism is chosen by the governing VTC
+    /// or VTN, and nothing here selects one or resolves it. `BitstringStatusListEntry` is
+    /// the common choice.
+    ///
+    /// ```
+    /// # use chrono::{Duration, Utc};
+    /// # use dtg_credentials::DTGCredential;
+    /// # use serde_json::json;
+    /// let vdc = DTGCredential::new_vdc(
+    ///     "did:example:delegator".to_string(),
+    ///     "did:example:delegate".to_string(),
+    ///     Utc::now(),
+    ///     Utc::now() + Duration::days(90),
+    ///     vec!["sign:invoices".to_string()],
+    ///     None,
+    /// )
+    /// .unwrap()
+    /// .with_credential_status(json!({
+    ///     "id": "https://example.com/status/3#94567",
+    ///     "type": "BitstringStatusListEntry",
+    ///     "statusPurpose": "revocation",
+    ///     "statusListIndex": "94567",
+    ///     "statusListCredential": "https://example.com/status/3"
+    /// }));
+    /// assert!(vdc.credential().credential_status.is_some());
+    /// ```
+    ///
+    /// # When a VDC needs one
+    ///
+    /// CONDITIONAL, not required. A verifier MUST be able to establish that an appointment
+    /// is in force without contacting the delegator, and either of two things satisfies
+    /// that: a `validUntil` short enough that expiry alone bounds the exposure, or a status
+    /// entry the verifier can check. A VDC MUST carry one where its validity period exceeds
+    /// the freshness window the governing VTC or VTN defines for delegations, and MAY omit
+    /// it otherwise.
+    ///
+    /// That window is governance this library does not know, so it cannot decide for a
+    /// caller which side of the condition a given VDC falls on — hence a setter rather than
+    /// a constructor parameter. Prefer short validity and re-issuance wherever the
+    /// delegator is reachable: a status check is a live lookup that reveals the
+    /// verification event to whoever hosts the status list. A long-lived appointment made
+    /// in advance of a delegator's unavailability is the case this exists for.
+    ///
+    /// # Set it before signing
+    ///
+    /// Same caveat as [DTGCredential::with_id] — a Data Integrity proof covers the
+    /// credential minus its `proof`, so attaching a status entry to an already-signed
+    /// credential leaves a document whose proof no longer verifies.
+    ///
+    /// # This library does not check it
+    ///
+    /// Neither [`crate::delegation::verify_chain`] nor [`crate::authority::verify_chain`]
+    /// resolves a status entry; both verify structure, scope and validity only. Revocation
+    /// is a live lookup the caller performs.
+    pub fn with_credential_status(mut self, status: Value) -> Self {
+        self.credential.credential_status = Some(status);
+        self
+    }
+
+    /// Attaches a revocation status mechanism in place.
+    ///
+    /// The non-consuming form of [DTGCredential::with_credential_status]; the same "before
+    /// signing" caveat and the same CONDITIONAL rule apply.
+    pub fn set_credential_status(&mut self, status: Value) {
+        self.credential.credential_status = Some(status);
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `credentialStatus` can be set on a credential being built
+
+[`DTGCredential::with_credential_status`] and its non-consuming `set_credential_status`
+attach the status mechanism through which a verifier determines whether a credential has
+been revoked. `DTGCommon::credential_status` has been modelled since 0.7.0, but only so
+that an entry already on the wire survived a round trip without changing the digest — a
+credential built by one of the `new_*` constructors had no way to acquire one short of
+reaching through `credential_mut`.
+
+This is CONDITIONAL on a VDC rather than required, which is why it is a setter and not a
+constructor parameter. A verifier must be able to establish that an appointment is in force
+without contacting the delegator, and either of two things satisfies that: a `validUntil`
+short enough that expiry alone bounds the exposure, or a status entry it can check. A VDC
+MUST carry one where its validity exceeds the freshness window the governing VTC or VTN
+defines for delegations, and MAY omit it otherwise. That window is governance this library
+does not know, so it cannot decide which side of the condition a given VDC falls on;
+demanding the entry from every caller would forbid the short-validity case the
+specification prefers.
+
+Neither `delegation::verify_chain` nor `authority::verify_chain` resolves the entry.
+Revocation remains a live lookup the caller performs.
+
+### Added — `PartialEq` on `DTGCredentialType`
+
+Consumers had to assert by pattern (`matches!`) rather than by equality; `assert_eq!` now
+works and reports the actual variant when it fails. `Eq` is derived alongside it.
+
+
 ## [0.8.0] - 2026-09-09
 
 **A VAC is not a bearer credential.** This release implements the rule and removes the
