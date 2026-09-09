@@ -311,9 +311,65 @@ and what the chain appoints for. Two consequences worth stating: nothing the
 delegator holds is copied to the delegate, and withdrawing the delegator's own
 permission stops every delegate at once, without revoking a single VDC.
 
-Not implemented here: revocation (`credentialStatus` is modelled but not resolved),
-and invocation binding — a VDC is not a bearer token, and nothing in this crate
-establishes that the party presenting a chain controls the leaf's subject identifier.
+### A VDC is not a bearer credential
+
+`verify_chain` takes a `presenter` and requires the leaf to appoint it, refusing
+otherwise with `NotTheDelegate`. That is Working Draft 02's **Invocation Binding**
+rule, and it is the same rule the VAC carries — sharper here, if anything: a captured
+VAC replays whatever it confers, while a captured VDC replays *as somebody*, and
+every act it carries is attributed to the principal.
+
+Pass the identifier of a party whose key control you have already established for
+**this request** — the DID a transport authenticated, or one a signature over the
+request proved. An identifier read out of the request body reduces the check to a
+string comparison an attacker chooses both sides of.
+
+Only the leaf's delegate is asked for anything. The parties above it in the chain are
+not present, which is what keeps re-delegation working.
+
+Not implemented here: revocation — `credentialStatus` is modelled and settable, but
+never resolved.
+
+## Upgrading
+
+**Upgrade verifiers before issuers.** Both directions of a version skew are errors,
+but only one of them says so clearly.
+
+A new credential reaching an old verifier is the confusing direction. 0.7 changed
+`authority.parent` and `delegation.parent` from an `id` to a `digestMultibase`, so a
+0.6 verifier compares a digest against an `id`, finds them unequal, and reports a
+broken chain:
+
+```
+chain link 0 names parent `zQmPvoSXm7pYriaeeE3DRWVybmhYDkMt1UtNrxiRdFfRcrT`,
+but was presented after `urn:uuid:064710ef-90ab-4013-9f95-f224af758754`
+```
+
+Both values are printed and nothing says they are different *kinds* of identifier, so
+it reads exactly like a tampered or interleaved chain. It is not: it is a 0.6 verifier
+being handed a 0.7 credential. Old verifiers cannot be taught to say this — the fix is
+ordering.
+
+The other direction is safe and loud. An old credential reaching a new verifier fails
+with `InvalidDigest`, which names the Working Draft 01 `sha256:<hex>` form explicitly
+rather than reporting it as a mismatch.
+
+Since clients commonly upgrade ahead of the services they talk to, that ordering is
+worth stating for each breaking release:
+
+| Release | What changed on the wire or at the boundary | Ordering |
+| --- | --- | --- |
+| 0.7.0 | `parent` became a `digestMultibase`; `digest` → `digestMultibase` | Verifiers first |
+| 0.8.0 | `authority::verify_chain` requires the leaf to grant to `presenter`; `audience` removed | Verifiers first |
+| 0.9.1 | `delegation::verify_chain` requires the leaf to appoint `presenter` | Verifiers first |
+
+Every one of them is *verifiers first*, and for the same reason: each made a verifier
+stricter or changed what it reads, so a verifier that moves first accepts everything
+it did before and is ready for what issuers send next.
+
+`0.8.0` and `0.9.1` are API breaks rather than wire changes — no credential changes
+shape — but they land in the same place: a caller that upgrades gets a compile error
+naming the new parameter, which is the intended way to find out.
 
 ## End to End Example
 

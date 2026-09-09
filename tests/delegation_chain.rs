@@ -42,7 +42,7 @@ fn root_delegation() -> DTGCredential {
 #[test]
 fn a_root_delegation_verifies_for_what_it_appoints() {
     let root = root_delegation();
-    let v = verify_chain(&[root], ALICE, "schedule:propose", t(1)).expect("should verify");
+    let v = verify_chain(&[root], ALICE, "schedule:propose", AGENT, t(1)).expect("should verify");
 
     assert_eq!(v.delegate, AGENT);
     assert_eq!(v.principal, ALICE);
@@ -52,7 +52,7 @@ fn a_root_delegation_verifies_for_what_it_appoints() {
 #[test]
 fn an_act_outside_the_appointment_is_refused() {
     let root = root_delegation();
-    let err = verify_chain(&[root], ALICE, "schedule:cancel", t(1)).unwrap_err();
+    let err = verify_chain(&[root], ALICE, "schedule:cancel", AGENT, t(1)).unwrap_err();
 
     assert!(
         matches!(err, DelegationError::ActNotAppointed { ref act } if act == "schedule:cancel"),
@@ -65,7 +65,7 @@ fn an_act_outside_the_appointment_is_refused() {
 #[test]
 fn a_chain_rooted_elsewhere_establishes_nothing() {
     let root = root_delegation();
-    let err = verify_chain(&[root], MALLORY, "schedule:read", t(1)).unwrap_err();
+    let err = verify_chain(&[root], MALLORY, "schedule:read", AGENT, t(1)).unwrap_err();
 
     assert!(
         matches!(err, DelegationError::RootNotPrincipal { .. }),
@@ -171,9 +171,67 @@ fn an_acceptance_in_a_chain_is_refused() {
     let acceptance =
         DTGCredential::new_delegate_vdc(&wire(&grant), t(0), t(24 * 90)).expect("accepts");
 
-    let err = verify_chain(&[acceptance], ALICE, "schedule:read", t(1)).unwrap_err();
+    let err = verify_chain(&[acceptance], ALICE, "schedule:read", AGENT, t(1)).unwrap_err();
     assert!(
         matches!(err, DelegationError::AcceptanceInChain { index: 0 }),
+        "got {err:?}"
+    );
+}
+
+/// A VDC is not a bearer token. Whoever captures a presentation must not be able to replay
+/// it — and replaying a delegation is worse than replaying authority, because every act it
+/// carries is attributed to the principal.
+#[test]
+fn a_captured_vdc_is_not_replayable_by_its_captor() {
+    let root = root_delegation(); // appoints AGENT
+
+    let err = verify_chain(&[root], ALICE, "schedule:read", MALLORY, t(1)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DelegationError::NotTheDelegate { ref delegate, ref presenter }
+                if delegate == AGENT && presenter == MALLORY
+        ),
+        "got {err:?}"
+    );
+}
+
+/// The principal is not the delegate either. Alice presenting her own delegation is not
+/// acting in her own name via it, and the chain establishes nothing about her.
+#[test]
+fn the_principal_is_not_the_delegate() {
+    let root = root_delegation();
+
+    let err = verify_chain(&[root], ALICE, "schedule:read", ALICE, t(1)).unwrap_err();
+    assert!(
+        matches!(err, DelegationError::NotTheDelegate { .. }),
+        "got {err:?}"
+    );
+}
+
+/// Only the *leaf's* delegate demonstrates anything. The agent that re-delegated is not
+/// present and is asked for nothing — requiring otherwise would defeat re-delegation.
+#[test]
+fn an_intermediate_delegate_cannot_present_a_chain_below_it() {
+    let root = root_delegation();
+    let sub = root
+        .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(0), t(24))
+        .expect("redelegation");
+
+    // The sub-agent presents it: accepted.
+    verify_chain(
+        &[sub.clone(), root.clone()],
+        ALICE,
+        "schedule:read",
+        SUBAGENT,
+        t(1),
+    )
+    .expect("the leaf's delegate may present");
+
+    // The agent above it presents the same chain: refused.
+    let err = verify_chain(&[sub, root], ALICE, "schedule:read", AGENT, t(1)).unwrap_err();
+    assert!(
+        matches!(err, DelegationError::NotTheDelegate { ref delegate, .. } if delegate == SUBAGENT),
         "got {err:?}"
     );
 }
@@ -190,7 +248,8 @@ fn a_permitted_redelegation_verifies() {
         .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(0), t(24))
         .expect("redelegation");
 
-    let v = verify_chain(&[sub, root], ALICE, "schedule:read", t(1)).expect("should verify");
+    let v =
+        verify_chain(&[sub, root], ALICE, "schedule:read", SUBAGENT, t(1)).expect("should verify");
     assert_eq!(v.delegate, SUBAGENT);
     assert_eq!(
         v.principal, ALICE,
@@ -273,7 +332,7 @@ fn a_widened_link_is_refused_by_the_verifier() {
         d.parent = Some(root.digest_multibase().unwrap());
     }
 
-    let err = verify_chain(&[widened, root], ALICE, "schedule:cancel", t(1)).unwrap_err();
+    let err = verify_chain(&[widened, root], ALICE, "schedule:cancel", SUBAGENT, t(1)).unwrap_err();
     assert!(
         matches!(err, DelegationError::WidensScope { ref act, .. } if act == "schedule:cancel"),
         "got {err:?}"
@@ -298,7 +357,7 @@ fn a_link_issued_by_someone_other_than_the_parents_delegate_is_refused() {
         d.parent = Some(root.digest_multibase().unwrap());
     }
 
-    let err = verify_chain(&[grafted, root], ALICE, "schedule:read", t(1)).unwrap_err();
+    let err = verify_chain(&[grafted, root], ALICE, "schedule:read", MALLORY, t(1)).unwrap_err();
     assert!(
         matches!(err, DelegationError::IssuerNotParentSubject { .. }),
         "got {err:?}"
@@ -337,7 +396,7 @@ fn a_link_naming_a_different_parent_is_refused() {
         );
     }
 
-    let err = verify_chain(&[sub, root], ALICE, "schedule:read", t(1)).unwrap_err();
+    let err = verify_chain(&[sub, root], ALICE, "schedule:read", SUBAGENT, t(1)).unwrap_err();
     assert!(
         matches!(err, DelegationError::BrokenLink { index: 0, .. }),
         "got {err:?}"
@@ -354,7 +413,7 @@ fn a_truncated_chain_does_not_resolve_to_the_principal() {
         .redelegate(SUBAGENT.into(), vec!["schedule:read".into()], t(0), t(24))
         .unwrap();
 
-    let err = verify_chain(&[sub], ALICE, "schedule:read", t(1)).unwrap_err();
+    let err = verify_chain(&[sub], ALICE, "schedule:read", SUBAGENT, t(1)).unwrap_err();
     assert!(
         matches!(err, DelegationError::RootNotPrincipal { .. }),
         "got {err:?}"
@@ -373,7 +432,7 @@ fn a_root_that_names_a_parent_is_refused() {
         );
     }
 
-    let err = verify_chain(&[root], ALICE, "schedule:read", t(1)).unwrap_err();
+    let err = verify_chain(&[root], ALICE, "schedule:read", AGENT, t(1)).unwrap_err();
     assert!(
         matches!(err, DelegationError::BrokenLink { .. }),
         "got {err:?}"
@@ -483,7 +542,7 @@ fn a_delegation_without_an_expiry_is_refused() {
     });
 
     let vdc: DTGCredential = serde_json::from_value(json).expect("parses");
-    let err = verify_chain(&[vdc], ALICE, "schedule:read", t(1)).unwrap_err();
+    let err = verify_chain(&[vdc], ALICE, "schedule:read", AGENT, t(1)).unwrap_err();
     assert!(
         matches!(err, DelegationError::NoExpiry { index: 0 }),
         "got {err:?}"
@@ -496,7 +555,7 @@ fn an_over_deep_chain_is_refused() {
     let root = root_delegation();
     let chain: Vec<DTGCredential> = std::iter::repeat_n(root, MAX_CHAIN_DEPTH + 1).collect();
 
-    let err = verify_chain(&chain, ALICE, "schedule:read", t(1)).unwrap_err();
+    let err = verify_chain(&chain, ALICE, "schedule:read", AGENT, t(1)).unwrap_err();
     assert!(
         matches!(err, DelegationError::TooDeep { found } if found == MAX_CHAIN_DEPTH + 1),
         "got {err:?}"
@@ -508,7 +567,7 @@ fn an_over_deep_chain_is_refused() {
 #[test]
 fn an_expired_link_is_refused() {
     let root = root_delegation();
-    let err = verify_chain(&[root], ALICE, "schedule:read", t(24 * 365)).unwrap_err();
+    let err = verify_chain(&[root], ALICE, "schedule:read", AGENT, t(24 * 365)).unwrap_err();
     assert!(
         matches!(err, DelegationError::NotValidNow { index: 0, .. }),
         "got {err:?}"

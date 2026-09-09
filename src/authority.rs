@@ -139,13 +139,18 @@ pub enum AuthorityError {
     },
 
     /// A link's `parent` did not name the credential presented as its parent.
+    ///
+    /// Both fields are `digestMultibase` values, not identifiers. Working Draft 02 changed
+    /// `parent` from an `id` to a digest, so a value here that looks like a `urn:uuid:` or
+    /// a WD01 `sha256:<hex>` is a version skew rather than a mismatched chain — see the
+    /// upgrade ordering notes in the README.
     #[error("chain link {index} names parent `{named}`, but was presented after `{presented}`")]
     BrokenLink {
         /// Position in the chain, leaf first.
         index: usize,
-        /// The `id` the link points at.
+        /// The `digestMultibase` the link points at, as it was carried.
         named: String,
-        /// The `id` of the credential actually presented as its parent.
+        /// The digest of the credential actually presented as its parent.
         presented: String,
     },
 

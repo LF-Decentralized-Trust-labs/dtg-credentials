@@ -365,10 +365,13 @@ async fn main() -> Result<()> {
     }
     println!("scheduler countersigned — the delegation edge is complete");
 
+    // The scheduler presents it, and must: a VDC is not a bearer token, so the verifier
+    // requires the leaf to appoint whoever is presenting it.
     let appointed = delegation::verify_chain(
         std::slice::from_ref(&appointment),
         &bob_did,
         "schedule:propose",
+        &scheduler_did,
         Utc::now(),
     )
     .context("the scheduler's appointment must verify")?;
@@ -376,6 +379,20 @@ async fn main() -> Result<()> {
         "  chain verified → acts are attributed to {}, not to the scheduler",
         &appointed.principal[..18]
     );
+
+    // And nobody else can present it, however they came by it.
+    if delegation::verify_chain(
+        std::slice::from_ref(&appointment),
+        &bob_did,
+        "schedule:propose",
+        &agent_did,
+        Utc::now(),
+    )
+    .is_ok()
+    {
+        bail!("a VDC must not verify for a party it does not appoint");
+    }
+    println!("  the same VDC presented by anyone else → refused (not a bearer token)");
 
     // The rule that keeps the two credentials from reinterpreting each other. The VDC says
     // the scheduler may speak in Bob's name; it says nothing about what Bob may do in the

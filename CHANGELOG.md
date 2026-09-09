@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-09
+
+Closes the two findings in #22 and #23.
+
+> [!IMPORTANT]
+> **This release is API-breaking despite the patch version.** `delegation::verify_chain`
+> takes a new `presenter` argument. The version was chosen deliberately — 0.9.0 published
+> hours earlier and has no known consumers — but note that Cargo treats `0.9.1` as
+> semver-compatible with `0.9.0`, so anyone depending on `dtg-credentials = "0.9"` picks
+> this up on a routine `cargo update` and gets a compile error naming the new parameter.
+
+### Changed — a VDC is not a bearer credential either (breaking)
+
+`delegation::verify_chain` now takes `presenter: &str` and requires the leaf to appoint
+it, refusing otherwise with the new `DelegationError::NotTheDelegate`. Nothing else about
+the chain changed.
+
+0.8.0 did this for the VAC and left the VDC alone, and the asymmetry was the whole of the
+gap: `VerifiedDelegation.delegate` was returned, so a caller *could* compare it, but
+nothing in the signature obliged them to — exactly the shape the VAC was in before 0.8.0,
+where two consumers each discovered the omission independently and patched around it.
+
+This is Working Draft 02's **Invocation Binding** rule, stated normatively: a verifier
+MUST NOT accept a party as acting in the delegator's name unless that party demonstrates
+control of the verification method associated with `credentialSubject.id`. A VDC presented
+without that demonstration is evidence a delegation exists, not evidence that whoever
+presented it is the delegate.
+
+Delegation is if anything the sharper case. A captured VAC replays whatever it confers; a
+captured VDC replays *as somebody*, and every act it carries is attributed to the
+principal. Only the leaf's delegate is asked for anything — the parties above it are not
+present, which is what keeps re-delegation working.
+
+### Added — upgrade ordering, for every breaking release so far
+
+A new **Upgrading** section in the README states which end moves first, and why: verifiers
+before issuers, for 0.7.0, 0.8.0 and this release alike.
+
+A new credential reaching an old verifier is the direction that misleads. 0.7 changed
+`parent` from an `id` to a `digestMultibase`, so a 0.6 verifier compares a digest against
+an `id` and reports a broken chain — printing both values, with nothing to say they are
+different *kinds* of identifier. It reads as a tampered or interleaved chain, which is
+what that error means every other time. An old verifier cannot be taught to say otherwise,
+so the fix is ordering rather than a better message.
+
+The other direction was already safe and loud: an old credential reaching a new verifier
+fails with `InvalidDigest`, which names the Working Draft 01 `sha256:<hex>` form
+explicitly.
+
+### Fixed — `BrokenLink` documented its fields as identifiers
+
+`AuthorityError::BrokenLink` described `named` and `presented` as "the `id` the link points
+at" and "the `id` of the credential actually presented". Both have carried digests since
+0.7.0. The wording is plausibly part of why the skew above reads as a mismatched chain to
+whoever goes looking, so it now says `digestMultibase`, and the variant's own documentation
+points at the upgrade ordering. `DelegationError::BrokenLink` documented its fields not at
+all, and now matches.
+
+
 ## [0.9.0] - 2026-09-09
 
 **Two additions from the conformance audit in #10**, which the Working Draft 02 work
