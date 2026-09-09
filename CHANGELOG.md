@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-09
+
+**Two additions from the conformance audit in #10**, which the Working Draft 02 work
+closed without. Both are additive: no API breaks, and nothing changes on the wire for a
+credential that does not use them.
+
 ### Added — `credentialStatus` can be set on a credential being built
 
 [`DTGCredential::with_credential_status`] and its non-consuming `set_credential_status`
@@ -33,7 +39,6 @@ Revocation remains a live lookup the caller performs.
 
 Consumers had to assert by pattern (`matches!`) rather than by equality; `assert_eq!` now
 works and reports the actual variant when it fails. `Eq` is derived alongside it.
-
 
 ## [0.8.0] - 2026-09-09
 
