@@ -31,6 +31,31 @@
 //! ancestry, including the principal's identity — which is the other reason a single hop
 //! is the default.
 //!
+//! # A VDC is not a bearer credential
+//!
+//! [`verify_chain`] takes a `presenter` and requires the leaf to appoint it. That is the
+//! **Invocation Binding** rule of Working Draft 02, stated normatively: *a verifier MUST
+//! NOT accept a party as acting in the delegator's name unless that party demonstrates
+//! control of the verification method associated with `credentialSubject.id` at the time
+//! of the request. A VDC presented without such a demonstration is evidence that a
+//! delegation exists; it is not evidence that the party presenting it is the delegate.*
+//!
+//! Same rule, and the same reasoning, as [`crate::authority::verify_chain`]. Acting in
+//! another's name is if anything the sharper case: a captured VAC replays whatever it
+//! confers, while a captured VDC replays *as somebody*, and every act it carries is
+//! attributed to the principal.
+//!
+//! **What `presenter` must be.** The identifier of a party whose key control the caller
+//! has already established for *this request* — the DID a transport authenticated, or one
+//! a signature over the request proved. Passing an identifier the caller merely read out
+//! of the request body reduces this check to a string comparison an attacker chooses both
+//! sides of.
+//!
+//! **Only the leaf's delegate demonstrates anything.** The parties above it in the chain
+//! are not present and are asked for nothing. Requiring otherwise would defeat
+//! re-delegation, whose whole purpose is that the delegator is not in the loop when its
+//! delegate acts.
+//!
 //! # Not implemented here
 //!
 //! **The acceptance.** A delegation edge is complete only when the delegate has
@@ -42,9 +67,7 @@
 //! **Revocation.** A VDC's `credentialStatus` is a live lookup this crate does not
 //! perform. See [`crate::DTGCommon::credential_status`].
 //!
-//! **Invocation binding.** A VDC is not a bearer token. Nothing here establishes that the
-//! party presenting the chain controls the leaf's `credentialSubject.id`; that
-//! demonstration belongs to the trust task in which the delegation is exercised.
+//! Nothing else. Invocation binding used to be listed here; see below.
 
 use chrono::{DateTime, Utc};
 
@@ -89,8 +112,11 @@ pub enum DelegationError {
     /// A link's `parent` did not match the credential presented above it.
     #[error("delegation at index {index} names parent {named}, but {presented} was presented")]
     BrokenLink {
+        /// Position in the chain, leaf first.
         index: usize,
+        /// The `digestMultibase` the link points at, as it was carried.
         named: String,
+        /// The digest of the credential actually presented as its parent.
         presented: String,
     },
 
@@ -150,6 +176,19 @@ pub enum DelegationError {
     /// The leaf does not appoint for the act asked about.
     #[error("the delegation does not appoint for `{act}`")]
     ActNotAppointed { act: String },
+
+    /// The leaf appoints somebody other than the party presenting it.
+    ///
+    /// A VDC is evidence that a delegation exists. It is not evidence that whoever handed
+    /// it over is the delegate, and a verifier that conflated the two would let anyone who
+    /// ever observed a presentation act in the principal's name.
+    #[error("the chain's leaf appoints `{delegate}`, but it was presented by `{presenter}`")]
+    NotTheDelegate {
+        /// Who the leaf appoints.
+        delegate: String,
+        /// Who presented it.
+        presenter: String,
+    },
 }
 
 /// Maximum number of VDCs in a chain, including the root delegation.
@@ -190,10 +229,18 @@ pub struct VerifiedDelegation {
 /// A successful return means the delegate may act in `principal`'s name for
 /// `requested_act`. Whether *`principal`* may perform that act is a separate question this
 /// crate does not answer, and a VDC never influences its outcome.
+///
+/// # `presenter` must be a party whose key control is already established
+///
+/// The leaf must appoint `presenter`, or the chain is refused with
+/// [`DelegationError::NotTheDelegate`]. Pass the identifier of a party whose control of
+/// the associated verification method the caller has established for *this request* — not
+/// one read out of the request body. See the module documentation.
 pub fn verify_chain(
     chain: &[DTGCredential],
     principal: &str,
     requested_act: &str,
+    presenter: &str,
     at: DateTime<Utc>,
 ) -> Result<VerifiedDelegation, DelegationError> {
     if chain.is_empty() {
@@ -240,6 +287,20 @@ pub fn verify_chain(
         if until < at {
             return Err(DelegationError::NotValidNow { index, at });
         }
+    }
+
+    // Invocation binding: the leaf must appoint whoever is presenting it.
+    //
+    // Without this a presentation is a bearer object — it names what may be done and in
+    // whose name, but not who is doing it — so anyone who observes one can act as the
+    // principal. The check is only as good as `presenter`: see the module docs on what a
+    // caller must have established before passing one.
+    let leaf_delegate = chain[0].credential().subject();
+    if leaf_delegate != presenter {
+        return Err(DelegationError::NotTheDelegate {
+            delegate: leaf_delegate.to_string(),
+            presenter: presenter.to_string(),
+        });
     }
 
     // Walk leaf -> root. Each step checks the link against the credential above it.
