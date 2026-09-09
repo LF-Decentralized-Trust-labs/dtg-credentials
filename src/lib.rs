@@ -622,7 +622,11 @@ pub fn digest_json(doc: &Value) -> Result<String, DTGCredentialError> {
 }
 
 /// TDG VC Type Identifiers
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` is derived so that a consumer can assert by equality
+/// (`assert_eq!(cred.credential_type(), &DTGCredentialType::Delegation)`) rather than by
+/// pattern (`matches!`), which reports the actual variant on failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DTGCredentialType {
     Membership,
@@ -2361,6 +2365,91 @@ mod tests {
 
         // A grant on its own does not complete anything — it carries no digest to check.
         assert!(!grant.acknowledges(&grant).unwrap());
+    }
+
+    /// A VDC's `credentialStatus` is CONDITIONAL, not required: a delegation whose validity
+    /// exceeds the freshness window the governing VTC or VTN defines MUST carry one, and
+    /// one short enough to be bounded by expiry alone MAY omit it. This library does not
+    /// know that window, so the entry is attached rather than demanded — and once attached,
+    /// it must reach the wire.
+    #[test]
+    fn a_vdc_carries_the_credential_status_it_is_given() {
+        let valid_from = DateTime::parse_from_rfc3339("2025-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let valid_until = DateTime::parse_from_rfc3339("2026-12-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let status = serde_json::json!({
+            "id": "https://delegator.example/status#12",
+            "type": "BitstringStatusListEntry",
+            "statusPurpose": "revocation",
+            "statusListIndex": "12"
+        });
+
+        let vdc = DTGCredential::new_vdc(
+            "did:example:delegator".to_string(),
+            "did:example:delegate".to_string(),
+            valid_from,
+            valid_until,
+            vec!["sign:invoices".to_string()],
+            None,
+        )
+        .expect("a bounded grant is well formed");
+
+        // Omitting it is legitimate, so the constructor must not invent one.
+        assert!(
+            vdc.credential().credential_status.is_none(),
+            "a VDC MAY omit `credentialStatus`, so the constructor must not supply one"
+        );
+
+        let vdc = vdc.with_credential_status(status.clone());
+        assert_eq!(vdc.credential().credential_status.as_ref(), Some(&status));
+        assert_eq!(wire(&vdc).get("credentialStatus"), Some(&status));
+
+        // And it must survive the trip back, or a verifier reading the wire form loses the
+        // only thing that lets it check revocation.
+        let parsed: DTGCredential = serde_json::from_value(wire(&vdc)).expect("parses");
+        assert_eq!(
+            parsed.credential().credential_status.as_ref(),
+            Some(&status)
+        );
+    }
+
+    /// The non-consuming form sets the same field.
+    #[test]
+    fn set_credential_status_matches_the_builder() {
+        let status = serde_json::json!({ "type": "BitstringStatusListEntry" });
+
+        let mut vmc = DTGCredential::new_vmc(
+            "did:example:community".to_string(),
+            "did:example:member".to_string(),
+            Utc::now(),
+            None,
+            false,
+        );
+        vmc.set_credential_status(status.clone());
+
+        assert_eq!(vmc.credential().credential_status.as_ref(), Some(&status));
+    }
+
+    /// `DTGCredentialType` derives `PartialEq` so a consumer can assert by equality rather
+    /// than by pattern, and get the actual variant reported on failure.
+    #[test]
+    fn credential_types_compare_by_equality() {
+        let vdc = DTGCredential::new_vdc(
+            "did:example:delegator".to_string(),
+            "did:example:delegate".to_string(),
+            Utc::now(),
+            Utc::now() + chrono::Duration::days(1),
+            vec!["sign:invoices".to_string()],
+            None,
+        )
+        .expect("a bounded grant is well formed");
+
+        assert_eq!(vdc.type_(), DTGCredentialType::Delegation);
+        assert_ne!(vdc.type_(), DTGCredentialType::Membership);
     }
 
     /// `credentialStatus` used to be dropped by a parse-then-re-serialise round trip, which

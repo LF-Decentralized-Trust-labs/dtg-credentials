@@ -366,6 +366,49 @@ credentials by `id` has no way to accept one that has none.
 > into the JSON after `sign()` produces a document whose proof no longer
 > verifies.
 
+## Revocation status
+
+A credential may carry `credentialStatus`, the W3C VC mechanism through which a
+verifier determines whether it has been revoked. The entry is opaque here: the
+mechanism is chosen by the governing VTC or VTN, and this library neither
+selects one nor resolves it. `BitstringStatusListEntry` is the common choice.
+
+The `new_*()` constructors leave it unset. Chain `with_credential_status()`:
+
+```Rust
+let vdc = DTGCredential::new_vdc(delegator, delegate, valid_from, valid_to, scope, None)?
+  .with_credential_status(json!({
+      "id": "https://example.com/status/3#94567",
+      "type": "BitstringStatusListEntry",
+      "statusPurpose": "revocation",
+      "statusListIndex": "94567",
+      "statusListCredential": "https://example.com/status/3"
+  }));
+```
+
+On a VDC this is CONDITIONAL, not required. A verifier MUST be able to establish
+that an appointment is currently in force without contacting the delegator, and
+two things satisfy that: a `validUntil` short enough that expiry alone bounds the
+exposure, with the delegator withdrawing by declining to re-issue; or a status
+entry the verifier can check. A VDC MUST carry one where its validity period
+exceeds the freshness window the governing VTC or VTN defines for delegations,
+and MAY omit it otherwise.
+
+That window is governance this library does not know, which is why this is a
+setter rather than a constructor parameter — nothing here can tell which side of
+the condition a given VDC falls on. Prefer short validity and re-issuance
+wherever the delegator is reachable: a status check is a live lookup that reveals
+the verification event to whoever hosts the status list. A long-lived appointment
+made in advance of a delegator's unavailability is the case status exists for.
+
+> [!IMPORTANT]
+> Set it **before** signing, for the same reason as `id`.
+
+> [!NOTE]
+> Neither `delegation::verify_chain` nor `authority::verify_chain` resolves a
+> status entry — both verify structure, scope and validity only. Revocation is a
+> live lookup you perform.
+
 ## Signing credentials
 
 By default the `affinidi-signing` feature is enabled which allows you to sign a
